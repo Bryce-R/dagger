@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from toy_dataset import CONTEXT_LEN
+
 class Block(nn.Module):
     def __init__(self, d_model=64, n_heads=4, mlp_ratio=4.0):
         super().__init__()
