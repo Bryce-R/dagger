@@ -24,6 +24,8 @@ CONTEXT_LEN = 16           # how many past states to feed into the transformer
 TRAIN_STATE_LIMIT = 1.2    # only keep training examples where |x| <= this
 TEST_PERTURB_STD = 0.3     # for test, start a bit more perturbed
 
+ON_MANIFOLD_ONLY = False # whether to only keep training examples where |x| <= TRAIN_STATE_LIMIT
+
 rng = np.random.default_rng(0)
 
 
@@ -74,7 +76,11 @@ def generate_dataset(num_traj=NUM_TRAJ):
             target_u = us[t-1]
 
             # Filter to mimic "on-manifold only" training data
-            if abs(window_states[-1]) <= TRAIN_STATE_LIMIT:
+            if ON_MANIFOLD_ONLY:
+                if abs(window_states[-1]) <= TRAIN_STATE_LIMIT:
+                    contexts.append(window_states.astype(np.float32))
+                    targets.append(np.float32(target_u))
+            else:
                 contexts.append(window_states.astype(np.float32))
                 targets.append(np.float32(target_u))
 
