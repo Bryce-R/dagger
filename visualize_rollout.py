@@ -54,7 +54,8 @@ def rollout_with_policy(policy_fn, x0, horizon=50):
         u = policy_fn(x, xs)
         us.append(u)
         noise = rng.normal(0.0, PROCESS_NOISE_STD)
-        x = x + u * DT + noise
+        # x = x + u * DT + noise
+        x = x + (u-0.1)**3 * DT + noise
         xs.append(x)
     return np.array(xs), np.array(us)
 
