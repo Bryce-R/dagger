@@ -39,9 +39,6 @@ def expert_policy(x):
         u = -K_GENTLE * x
     else:
         u = -K_STRONG * x
-    # get cubic root of u
-    u = np.cbrt(u) + 0.1
-
     # Clip steering (humans are bounded)
     u = np.clip(u, -U_MAX, U_MAX)
     return u
@@ -55,7 +52,7 @@ def simulate_expert_trajectory(x0=0.0):
         u = expert_policy(x)
         us.append(u)
         noise = rng.normal(0.0, PROCESS_NOISE_STD)
-        x = x + (u-0.1)**3 * DT + noise
+        x = x + u * DT + noise
         xs.append(x)
     return np.array(xs), np.array(us)  # xs has length TRAJ_LEN+1, us has TRAJ_LEN
 
