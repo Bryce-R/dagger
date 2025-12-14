@@ -29,27 +29,27 @@ ON_MANIFOLD_ONLY = False # whether to only keep training examples where |x| <= T
 rng = np.random.default_rng(0)
 
 
-def expert_policy(x):
+def expert_policy(x, center=0.0):
     """
     Simple "human" controller:
     - near center: gentle PD-ish correction
     - far away: strong correction
     """
     if abs(x) < STRONG_THRESHOLD:
-        u = -K_GENTLE * x
+        u = -K_GENTLE * (x - center)
     else:
-        u = -K_STRONG * x
+        u = -K_STRONG * (x - center)
     # Clip steering (humans are bounded)
     u = np.clip(u, -U_MAX, U_MAX)
     return u
 
 
-def simulate_expert_trajectory(x0=0.0):
+def simulate_expert_trajectory(x0=0.0, center=0.0):
     xs = [x0]
     us = []
     x = x0
     for t in range(TRAJ_LEN):
-        u = expert_policy(x)
+        u = expert_policy(x, center)
         us.append(u)
         noise = rng.normal(0.0, PROCESS_NOISE_STD)
         x = x + u * DT + noise
@@ -66,8 +66,11 @@ def generate_dataset(num_traj=NUM_TRAJ):
     targets = []
 
     for _ in range(num_traj):
+        # set expert tracking center to be random with the range of [-0.2, 0.2]
+        center = rng.uniform(-0.2, 0.2)
+        # print(f"Expert tracking center: {center}")
         x0 = rng.normal(0.0, 0.2)  # expert typically starts near center
-        xs, us = simulate_expert_trajectory(x0)
+        xs, us = simulate_expert_trajectory(x0, center)
 
         # Sliding windows: predict u_{t-1} from states [t-C, ..., t-1]
         for t in range(CONTEXT_LEN, TRAJ_LEN):
