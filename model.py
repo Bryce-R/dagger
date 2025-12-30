@@ -3,6 +3,27 @@ import torch.nn as nn
 
 from toy_dataset import CONTEXT_LEN
 
+
+class StopMLPPolicy(nn.Module):
+    """
+    Feed-forward policy for the stop-sign dataset.
+    Inputs: [position, velocity, stop_sign_position, distance_to_sign, prev_acceleration].
+    """
+
+    def __init__(self, input_dim=5, hidden_sizes=(128, 128)):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_sizes:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
 class Block(nn.Module):
     def __init__(self, d_model=64, n_heads=4, mlp_ratio=4.0):
         super().__init__()

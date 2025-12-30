@@ -93,14 +93,17 @@ def plot_rollouts(expert_trajs, learned_traj, output_path: Path, stop_sign_posit
     axes[0].set_ylabel("Position (m)")
     axes[0].set_title("Position vs. time")
     axes[0].legend(loc="lower right")
+    axes[0].grid(True)
 
     axes[1].set_ylabel("Velocity (m/s)")
     axes[1].set_title("Velocity vs. time")
+    axes[1].grid(True)
 
     axes[2].set_ylabel("Acceleration (m/s^2)")
     axes[2].set_xlabel("Time (s)")
     axes[2].set_title("Braking sequences (negative = braking)")
     axes[2].legend(loc="lower right")
+    axes[2].grid(True)
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
