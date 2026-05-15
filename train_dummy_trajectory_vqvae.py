@@ -186,6 +186,20 @@ def position_error_metrics(
   return float(abs_pos_error.detach()), float(final_pos_error.detach())
 
 
+def absolute_position_reconstruction_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+  """Loss on denormalized absolute positions reconstructed from deltas."""
+  mean = mean.to(target.device)
+  std = std.to(target.device)
+  target_xy = deltas_to_positions(target * std + mean)
+  recon_xy = deltas_to_positions(recon * std + mean)
+  return F.smooth_l1_loss(recon_xy, target_xy)
+
+
 def save_reconstruction_plot(
     model: nn.Module,
     x: torch.Tensor,
@@ -195,6 +209,7 @@ def save_reconstruction_plot(
     device: torch.device,
     output_dir: Path,
     epoch: int,
+    pdf_pages=None,
 ) -> None:
   """Saves target/reconstruction plots for one straight, left, and right sample."""
   import matplotlib.pyplot as plt
@@ -229,6 +244,8 @@ def save_reconstruction_plot(
   fig.suptitle(f"Trajectory VQ-VAE reconstruction, epoch {epoch}")
   fig.tight_layout()
   fig.savefig(output_dir / f"reconstruction_epoch_{epoch:04d}.png", dpi=150)
+  if pdf_pages is not None:
+    pdf_pages.savefig(fig)
   plt.close(fig)
 
 
@@ -270,59 +287,81 @@ def train(args: argparse.Namespace) -> None:
       commitment_weight=args.commitment_weight,
   ).to(device)
   optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+  pdf_pages = None
+  pdf_path = None
+  if args.plot_every > 0:
+    if args.plot_pdf is None:
+      pdf_path = Path(args.plot_dir) / "reconstructions.pdf"
+    elif args.plot_pdf:
+      pdf_path = Path(args.plot_pdf)
+    if pdf_path is not None:
+      from matplotlib.backends.backend_pdf import PdfPages
 
-  print(f"Training on {len(dataset)} synthetic trajectories with device={device}")
-  for epoch in range(1, args.epochs + 1):
-    model.train()
-    total_recon = 0.0
-    total_vq = 0.0
-    total_pos_mae = 0.0
-    total_final_pos_err = 0.0
-    total_batches = 0
-    last_indices = None
+      pdf_path.parent.mkdir(parents=True, exist_ok=True)
+      pdf_pages = PdfPages(pdf_path)
 
-    for batch_x, _ in loader:
-      batch_x = batch_x.to(device)
-      recon, vq_loss, indices = model(batch_x)
-      recon_loss = F.smooth_l1_loss(recon, batch_x)
-      pos_mae, final_pos_err = position_error_metrics(recon, batch_x, mean, std)
-      loss = recon_loss + vq_loss
+  try:
+    print(f"Training on {len(dataset)} synthetic trajectories with device={device}")
+    for epoch in range(1, args.epochs + 1):
+      model.train()
+      total_recon = 0.0
+      total_pos_loss = 0.0
+      total_vq = 0.0
+      total_pos_mae = 0.0
+      total_final_pos_err = 0.0
+      total_batches = 0
+      last_indices = None
 
-      optimizer.zero_grad(set_to_none=True)
-      loss.backward()
-      optimizer.step()
+      for batch_x, _ in loader:
+        batch_x = batch_x.to(device)
+        recon, vq_loss, indices = model(batch_x)
+        recon_loss = F.smooth_l1_loss(recon, batch_x)
+        pos_loss = absolute_position_reconstruction_loss(recon, batch_x, mean, std)
+        pos_mae, final_pos_err = position_error_metrics(recon, batch_x, mean, std)
+        loss = recon_loss + args.position_loss_weight * pos_loss + vq_loss
 
-      total_recon += float(recon_loss.detach())
-      total_vq += float(vq_loss.detach())
-      total_pos_mae += pos_mae
-      total_final_pos_err += final_pos_err
-      total_batches += 1
-      last_indices = indices.detach().cpu()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
-    if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
-      perplexity = codebook_perplexity(last_indices, args.num_codes)
-      print(
-          f"epoch={epoch:04d} "
-          f"recon={total_recon / total_batches:.5f} "
-          f"pos_mae={total_pos_mae / total_batches:.5f} "
-          f"final_pos_err={total_final_pos_err / total_batches:.5f} "
-          f"vq={total_vq / total_batches:.5f} "
-          f"last_batch_perplexity={perplexity:.2f}"
-      )
+        total_recon += float(recon_loss.detach())
+        total_pos_loss += float(pos_loss.detach())
+        total_vq += float(vq_loss.detach())
+        total_pos_mae += pos_mae
+        total_final_pos_err += final_pos_err
+        total_batches += 1
+        last_indices = indices.detach().cpu()
 
-    if args.plot_every > 0 and (
-        epoch == 1 or epoch % args.plot_every == 0 or epoch == args.epochs
-    ):
-      save_reconstruction_plot(
-          model=model,
-          x=x,
-          labels=labels,
-          mean=mean,
-          std=std,
-          device=device,
-          output_dir=Path(args.plot_dir),
-          epoch=epoch,
-      )
+      if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
+        perplexity = codebook_perplexity(last_indices, args.num_codes)
+        print(
+            f"epoch={epoch:04d} "
+            f"recon={total_recon / total_batches:.5f} "
+            f"pos_loss={total_pos_loss / total_batches:.5f} "
+            f"pos_mae={total_pos_mae / total_batches:.5f} "
+            f"final_pos_err={total_final_pos_err / total_batches:.5f} "
+            f"vq={total_vq / total_batches:.5f} "
+            f"last_batch_perplexity={perplexity:.2f}"
+        )
+
+      if args.plot_every > 0 and (
+          epoch == 1 or epoch % args.plot_every == 0 or epoch == args.epochs
+      ):
+        save_reconstruction_plot(
+            model=model,
+            x=x,
+            labels=labels,
+            mean=mean,
+            std=std,
+            device=device,
+            output_dir=Path(args.plot_dir),
+            epoch=epoch,
+            pdf_pages=pdf_pages,
+        )
+  finally:
+    if pdf_pages is not None:
+      pdf_pages.close()
+      print(f"Saved reconstruction PDF: {pdf_path}")
 
   model.eval()
   with torch.no_grad():
@@ -350,6 +389,12 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--code-dim", type=int, default=32)
   parser.add_argument("--num-codes", type=int, default=32)
   parser.add_argument("--commitment-weight", type=float, default=0.25)
+  parser.add_argument(
+      "--position-loss-weight",
+      type=float,
+      default=1.0,
+      help="Weight for denormalized absolute-position reconstruction loss.",
+  )
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--log-every", type=int, default=10)
   parser.add_argument(
@@ -359,6 +404,14 @@ def parse_args() -> argparse.Namespace:
       help="Save target/reconstruction plots every N epochs. Use 0 to disable.",
   )
   parser.add_argument("--plot-dir", default="trajectory_vqvae_plots")
+  parser.add_argument(
+      "--plot-pdf",
+      default=None,
+      help=(
+          "Multipage PDF path for reconstruction plots. Defaults to "
+          "<plot-dir>/reconstructions.pdf; pass an empty string to disable."
+      ),
+  )
   parser.add_argument("--seed", type=int, default=7)
   parser.add_argument(
       "--device",
