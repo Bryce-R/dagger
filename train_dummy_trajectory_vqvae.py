@@ -209,7 +209,6 @@ def save_reconstruction_plot(
     device: torch.device,
     output_dir: Path,
     epoch: int,
-    pdf_pages=None,
 ) -> None:
   """Saves target/reconstruction plots for one straight, left, and right sample."""
   import matplotlib.pyplot as plt
@@ -244,9 +243,28 @@ def save_reconstruction_plot(
   fig.suptitle(f"Trajectory VQ-VAE reconstruction, epoch {epoch}")
   fig.tight_layout()
   fig.savefig(output_dir / f"reconstruction_epoch_{epoch:04d}.png", dpi=150)
-  if pdf_pages is not None:
-    pdf_pages.savefig(fig)
   plt.close(fig)
+
+
+def save_reconstruction_pdf(plot_paths: list[Path], pdf_path: Path) -> None:
+  """Writes saved reconstruction plots to a PDF, newest epoch first."""
+  import matplotlib.image as mpimg
+  import matplotlib.pyplot as plt
+  from matplotlib.backends.backend_pdf import PdfPages
+
+  pdf_path.parent.mkdir(parents=True, exist_ok=True)
+  with PdfPages(pdf_path) as pdf_pages:
+    for plot_path in reversed(plot_paths):
+      image = mpimg.imread(plot_path)
+      height, width = image.shape[:2]
+      fig_width = 12.0
+      fig_height = fig_width * height / width
+      fig, axis = plt.subplots(figsize=(fig_width, fig_height))
+      axis.imshow(image)
+      axis.axis("off")
+      fig.tight_layout(pad=0)
+      pdf_pages.savefig(fig)
+      plt.close(fig)
 
 
 def select_device(device_arg: str) -> torch.device:
@@ -287,81 +305,77 @@ def train(args: argparse.Namespace) -> None:
       commitment_weight=args.commitment_weight,
   ).to(device)
   optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-  pdf_pages = None
   pdf_path = None
+  saved_plot_paths = []
   if args.plot_every > 0:
     if args.plot_pdf is None:
       pdf_path = Path(args.plot_dir) / "reconstructions.pdf"
     elif args.plot_pdf:
       pdf_path = Path(args.plot_pdf)
-    if pdf_path is not None:
-      from matplotlib.backends.backend_pdf import PdfPages
 
-      pdf_path.parent.mkdir(parents=True, exist_ok=True)
-      pdf_pages = PdfPages(pdf_path)
+  print(f"Training on {len(dataset)} synthetic trajectories with device={device}")
+  for epoch in range(1, args.epochs + 1):
+    model.train()
+    total_recon = 0.0
+    total_pos_loss = 0.0
+    total_vq = 0.0
+    total_pos_mae = 0.0
+    total_final_pos_err = 0.0
+    total_batches = 0
+    last_indices = None
 
-  try:
-    print(f"Training on {len(dataset)} synthetic trajectories with device={device}")
-    for epoch in range(1, args.epochs + 1):
-      model.train()
-      total_recon = 0.0
-      total_pos_loss = 0.0
-      total_vq = 0.0
-      total_pos_mae = 0.0
-      total_final_pos_err = 0.0
-      total_batches = 0
-      last_indices = None
+    for batch_x, _ in loader:
+      batch_x = batch_x.to(device)
+      recon, vq_loss, indices = model(batch_x)
+      recon_loss = F.smooth_l1_loss(recon, batch_x)
+      pos_loss = absolute_position_reconstruction_loss(recon, batch_x, mean, std)
+      pos_mae, final_pos_err = position_error_metrics(recon, batch_x, mean, std)
+      loss = recon_loss + args.position_loss_weight * pos_loss + vq_loss
 
-      for batch_x, _ in loader:
-        batch_x = batch_x.to(device)
-        recon, vq_loss, indices = model(batch_x)
-        recon_loss = F.smooth_l1_loss(recon, batch_x)
-        pos_loss = absolute_position_reconstruction_loss(recon, batch_x, mean, std)
-        pos_mae, final_pos_err = position_error_metrics(recon, batch_x, mean, std)
-        loss = recon_loss + args.position_loss_weight * pos_loss + vq_loss
+      optimizer.zero_grad(set_to_none=True)
+      loss.backward()
+      optimizer.step()
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+      total_recon += float(recon_loss.detach())
+      total_pos_loss += float(pos_loss.detach())
+      total_vq += float(vq_loss.detach())
+      total_pos_mae += pos_mae
+      total_final_pos_err += final_pos_err
+      total_batches += 1
+      last_indices = indices.detach().cpu()
 
-        total_recon += float(recon_loss.detach())
-        total_pos_loss += float(pos_loss.detach())
-        total_vq += float(vq_loss.detach())
-        total_pos_mae += pos_mae
-        total_final_pos_err += final_pos_err
-        total_batches += 1
-        last_indices = indices.detach().cpu()
+    if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
+      perplexity = codebook_perplexity(last_indices, args.num_codes)
+      print(
+          f"epoch={epoch:04d} "
+          f"recon={total_recon / total_batches:.5f} "
+          f"pos_loss={total_pos_loss / total_batches:.5f} "
+          f"pos_mae={total_pos_mae / total_batches:.5f} "
+          f"final_pos_err={total_final_pos_err / total_batches:.5f} "
+          f"vq={total_vq / total_batches:.5f} "
+          f"last_batch_perplexity={perplexity:.2f}"
+      )
 
-      if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
-        perplexity = codebook_perplexity(last_indices, args.num_codes)
-        print(
-            f"epoch={epoch:04d} "
-            f"recon={total_recon / total_batches:.5f} "
-            f"pos_loss={total_pos_loss / total_batches:.5f} "
-            f"pos_mae={total_pos_mae / total_batches:.5f} "
-            f"final_pos_err={total_final_pos_err / total_batches:.5f} "
-            f"vq={total_vq / total_batches:.5f} "
-            f"last_batch_perplexity={perplexity:.2f}"
-        )
+    if args.plot_every > 0 and (
+        epoch == 1 or epoch % args.plot_every == 0 or epoch == args.epochs
+    ):
+      save_reconstruction_plot(
+          model=model,
+          x=x,
+          labels=labels,
+          mean=mean,
+          std=std,
+          device=device,
+          output_dir=Path(args.plot_dir),
+          epoch=epoch,
+      )
+      saved_plot_paths.append(
+          Path(args.plot_dir) / f"reconstruction_epoch_{epoch:04d}.png"
+      )
 
-      if args.plot_every > 0 and (
-          epoch == 1 or epoch % args.plot_every == 0 or epoch == args.epochs
-      ):
-        save_reconstruction_plot(
-            model=model,
-            x=x,
-            labels=labels,
-            mean=mean,
-            std=std,
-            device=device,
-            output_dir=Path(args.plot_dir),
-            epoch=epoch,
-            pdf_pages=pdf_pages,
-        )
-  finally:
-    if pdf_pages is not None:
-      pdf_pages.close()
-      print(f"Saved reconstruction PDF: {pdf_path}")
+  if pdf_path is not None and saved_plot_paths:
+    save_reconstruction_pdf(saved_plot_paths, pdf_path)
+    print(f"Saved reconstruction PDF: {pdf_path}")
 
   model.eval()
   with torch.no_grad():
@@ -409,7 +423,8 @@ def parse_args() -> argparse.Namespace:
       default=None,
       help=(
           "Multipage PDF path for reconstruction plots. Defaults to "
-          "<plot-dir>/reconstructions.pdf; pass an empty string to disable."
+          "<plot-dir>/reconstructions.pdf; pages are newest epoch first. "
+          "Pass an empty string to disable."
       ),
   )
   parser.add_argument("--seed", type=int, default=7)
