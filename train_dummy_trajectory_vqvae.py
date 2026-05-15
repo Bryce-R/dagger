@@ -168,6 +168,24 @@ def deltas_to_positions(deltas: torch.Tensor) -> torch.Tensor:
   return torch.cumsum(deltas, dim=1)
 
 
+def position_error_metrics(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> tuple[float, float]:
+  """Returns mean absolute position error and final-point distance."""
+  mean = mean.to(target.device)
+  std = std.to(target.device)
+  target_xy = deltas_to_positions(target * std + mean)
+  recon_xy = deltas_to_positions(recon * std + mean)
+  abs_pos_error = (recon_xy - target_xy).abs().mean()
+  final_pos_error = torch.linalg.vector_norm(
+      recon_xy[:, -1] - target_xy[:, -1], dim=-1
+  ).mean()
+  return float(abs_pos_error.detach()), float(final_pos_error.detach())
+
+
 def save_reconstruction_plot(
     model: nn.Module,
     x: torch.Tensor,
@@ -258,6 +276,8 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     total_recon = 0.0
     total_vq = 0.0
+    total_pos_mae = 0.0
+    total_final_pos_err = 0.0
     total_batches = 0
     last_indices = None
 
@@ -265,6 +285,7 @@ def train(args: argparse.Namespace) -> None:
       batch_x = batch_x.to(device)
       recon, vq_loss, indices = model(batch_x)
       recon_loss = F.smooth_l1_loss(recon, batch_x)
+      pos_mae, final_pos_err = position_error_metrics(recon, batch_x, mean, std)
       loss = recon_loss + vq_loss
 
       optimizer.zero_grad(set_to_none=True)
@@ -273,6 +294,8 @@ def train(args: argparse.Namespace) -> None:
 
       total_recon += float(recon_loss.detach())
       total_vq += float(vq_loss.detach())
+      total_pos_mae += pos_mae
+      total_final_pos_err += final_pos_err
       total_batches += 1
       last_indices = indices.detach().cpu()
 
@@ -281,6 +304,8 @@ def train(args: argparse.Namespace) -> None:
       print(
           f"epoch={epoch:04d} "
           f"recon={total_recon / total_batches:.5f} "
+          f"pos_mae={total_pos_mae / total_batches:.5f} "
+          f"final_pos_err={total_final_pos_err / total_batches:.5f} "
           f"vq={total_vq / total_batches:.5f} "
           f"last_batch_perplexity={perplexity:.2f}"
       )
