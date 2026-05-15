@@ -90,10 +90,17 @@ def make_noisy_trajectory_dataset(
 class VectorQuantizer(nn.Module):
   """Nearest-neighbor vector quantizer with straight-through gradients."""
 
-  def __init__(self, num_codes: int, code_dim: int, commitment_weight: float):
+  def __init__(
+      self,
+      num_codes: int,
+      code_dim: int,
+      commitment_weight: float,
+      loss_mode: str,
+  ):
     super().__init__()
     self.codebook = nn.Embedding(num_codes, code_dim)
     self.commitment_weight = commitment_weight
+    self.loss_mode = loss_mode
     self.codebook.weight.data.uniform_(-1.0 / num_codes, 1.0 / num_codes)
 
   def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -109,9 +116,14 @@ class VectorQuantizer(nn.Module):
     indices = distances.argmin(dim=1)
     quantized = self.codebook(indices).view_as(z_bt)
 
-    codebook_loss = F.mse_loss(quantized, z_bt.detach())
-    commitment_loss = F.mse_loss(z_bt, quantized.detach())
-    vq_loss = codebook_loss + self.commitment_weight * commitment_loss
+    if self.loss_mode == "split":
+      codebook_loss = F.mse_loss(quantized, z_bt.detach())
+      commitment_loss = F.mse_loss(z_bt, quantized.detach())
+      vq_loss = codebook_loss + self.commitment_weight * commitment_loss
+    elif self.loss_mode == "single":
+      vq_loss = F.mse_loss(quantized, z_bt)
+    else:
+      raise ValueError(f"Unknown VQ loss mode: {self.loss_mode}")
 
     quantized = z_bt + (quantized - z_bt).detach()
     quantized = quantized.permute(0, 2, 1).contiguous()
@@ -129,6 +141,7 @@ class TrajectoryVQVAE(nn.Module):
       code_dim: int = 32,
       num_codes: int = 32,
       commitment_weight: float = 0.25,
+      vq_loss_mode: str = "single",
   ):
     super().__init__()
     self.encoder = nn.Sequential(
@@ -138,7 +151,9 @@ class TrajectoryVQVAE(nn.Module):
         nn.ReLU(),
         nn.Conv1d(hidden_dim, code_dim, kernel_size=3, padding=1),
     )
-    self.quantizer = VectorQuantizer(num_codes, code_dim, commitment_weight)
+    self.quantizer = VectorQuantizer(
+        num_codes, code_dim, commitment_weight, vq_loss_mode
+    )
     self.decoder = nn.Sequential(
         nn.Conv1d(code_dim, hidden_dim, kernel_size=3, padding=1),
         nn.ReLU(),
@@ -303,6 +318,7 @@ def train(args: argparse.Namespace) -> None:
       code_dim=args.code_dim,
       num_codes=args.num_codes,
       commitment_weight=args.commitment_weight,
+      vq_loss_mode=args.vq_loss_mode,
   ).to(device)
   optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
   pdf_path = None
@@ -403,6 +419,12 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--code-dim", type=int, default=32)
   parser.add_argument("--num-codes", type=int, default=32)
   parser.add_argument("--commitment-weight", type=float, default=0.25)
+  parser.add_argument(
+      "--vq-loss-mode",
+      choices=("split", "single"),
+      default="single",
+      help="Use the standard split VQ losses or one unsplit MSE loss.",
+  )
   parser.add_argument(
       "--position-loss-weight",
       type=float,
