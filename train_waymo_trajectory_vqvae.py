@@ -12,6 +12,17 @@ Example:
     --device mps \
     --epochs 20
 
+  # Long Waymo vehicle VQ-VAE run from the dagger repo root, using the TFRecord
+  # stored in the local waymo-open-dataset checkout:
+  env MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/private/tmp \
+    python train_waymo_trajectory_vqvae.py \
+      --tfrecord /Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000 \
+      --epochs 50000 \
+      --batch-size 512 \
+      --plot-every 5000 \
+      --log-every 1000 \
+      --plot-dir waymo_vehicle_trajectory_vqvae_plots_posw0_e50000_b512_dagger
+
   # If waymo_open_dataset is not installed, point this at a local checkout:
   WAYMO_OPEN_DATASET_ROOT=/Users/pengkai/Code/waymo-open-dataset \
     python train_waymo_trajectory_vqvae.py --tfrecord /path/to/scenario.tfrecord
