@@ -231,14 +231,48 @@ class VectorQuantizer(nn.Module):
     return quantized, vq_loss, indices.view(z.shape[0], z.shape[2])
 
 
+class FiniteScalarQuantizer(nn.Module):
+  """Straight-through finite scalar quantizer for channel-wise latent bins."""
+
+  def __init__(self, levels: list[int], code_dim: int):
+    super().__init__()
+    if len(levels) == 1:
+      levels = levels * code_dim
+    if len(levels) != code_dim:
+      raise ValueError(
+          f"FSQ levels length ({len(levels)}) must be 1 or match code_dim ({code_dim})."
+      )
+    if any(level < 2 for level in levels):
+      raise ValueError("All FSQ levels must be >= 2.")
+    levels_tensor = torch.tensor(levels, dtype=torch.float32)
+    self.register_buffer("levels", levels_tensor)
+    self.register_buffer("scale", levels_tensor - 1.0)
+
+  @property
+  def num_bins(self) -> int:
+    return int(self.levels.max().item())
+
+  def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    z_bt = z.permute(0, 2, 1).contiguous()
+    scale = self.scale.view(1, 1, -1)
+    bounded = (torch.tanh(z_bt) + 1.0) * 0.5 * scale
+    indices = torch.round(bounded).long()
+    quantized = (indices.float() / scale) * 2.0 - 1.0
+    quantized = z_bt + (quantized - z_bt).detach()
+    zero_loss = z.sum() * 0.0
+    return quantized.permute(0, 2, 1).contiguous(), zero_loss, indices
+
+
 class TrajectoryVQVAE(nn.Module):
-  """Small temporal convolutional VQ-VAE for [B, T, 2] trajectories."""
+  """Small temporal convolutional quantized autoencoder for [B, T, 2] trajectories."""
 
   def __init__(
       self,
       hidden_dim: int,
       code_dim: int,
       num_codes: int,
+      quantizer: str,
+      fsq_levels: list[int],
       vq_loss_mode: str,
   ):
     super().__init__()
@@ -249,7 +283,15 @@ class TrajectoryVQVAE(nn.Module):
         nn.ReLU(),
         nn.Conv1d(hidden_dim, code_dim, kernel_size=3, padding=1),
     )
-    self.quantizer = VectorQuantizer(num_codes, code_dim, vq_loss_mode)
+    self.quantizer_type = quantizer
+    if quantizer == "vq":
+      self.quantizer = VectorQuantizer(num_codes, code_dim, vq_loss_mode)
+      self.quantizer_bins = num_codes
+    elif quantizer == "fsq":
+      self.quantizer = FiniteScalarQuantizer(fsq_levels, code_dim)
+      self.quantizer_bins = self.quantizer.num_bins
+    else:
+      raise ValueError(f"Unknown quantizer: {quantizer}")
     self.decoder = nn.Sequential(
         nn.Conv1d(code_dim, hidden_dim, kernel_size=3, padding=1),
         nn.ReLU(),
@@ -374,15 +416,16 @@ def save_metrics_plot(metrics: list[dict[str, float]], output_paths: list[Path])
   plots = [
       ("recon", "Delta reconstruction loss"),
       ("pos_loss", "Absolute position loss"),
-      ("vq", "VQ loss"),
-      ("perplexity", "Last-batch code perplexity"),
+      ("vq", "Quantizer loss"),
+      ("perplexity", "Last-batch bin perplexity"),
   ]
   for axis, (key, title) in zip(axes.ravel(), plots):
     axis.plot(epochs, [row[key] for row in metrics], linewidth=1.8)
     axis.set_title(title)
     axis.set_xlabel("epoch")
     axis.grid(True, alpha=0.3)
-  axes[1, 0].set_yscale("log")
+  if any(row["vq"] > 0.0 for row in metrics):
+    axes[1, 0].set_yscale("log")
   axes[1, 1].set_ylim(bottom=0)
   fig.tight_layout()
   for output_path in output_paths:
@@ -444,6 +487,8 @@ def train(args: argparse.Namespace) -> None:
       hidden_dim=args.hidden_dim,
       code_dim=args.code_dim,
       num_codes=args.num_codes,
+      quantizer=args.quantizer,
+      fsq_levels=args.fsq_levels,
       vq_loss_mode=args.vq_loss_mode,
   ).to(device)
   optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -476,7 +521,7 @@ def train(args: argparse.Namespace) -> None:
       batches += 1
       last_indices = indices.detach().cpu()
 
-    perplexity = codebook_perplexity(last_indices, args.num_codes)
+    perplexity = codebook_perplexity(last_indices, model.quantizer_bins)
     epoch_metrics = {
         "epoch": epoch,
         "recon": total_recon / batches,
@@ -556,6 +601,17 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--hidden-dim", type=int, default=64)
   parser.add_argument("--code-dim", type=int, default=32)
   parser.add_argument("--num-codes", type=int, default=64)
+  parser.add_argument("--quantizer", choices=("vq", "fsq"), default="vq")
+  parser.add_argument(
+      "--fsq-levels",
+      type=int,
+      nargs="+",
+      default=[8],
+      help=(
+          "Scalar quantization levels for FSQ. A single value is repeated for "
+          "all code_dim channels; otherwise the list must match code_dim."
+      ),
+  )
   parser.add_argument("--vq-loss-mode", choices=("single", "split"), default="single")
   parser.add_argument("--position-loss-weight", type=float, default=0.0)
   parser.add_argument("--lr", type=float, default=3e-4)
