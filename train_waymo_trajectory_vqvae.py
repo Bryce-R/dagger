@@ -263,6 +263,16 @@ class FiniteScalarQuantizer(nn.Module):
     return quantized.permute(0, 2, 1).contiguous(), zero_loss, indices
 
 
+class IdentityQuantizer(nn.Module):
+  """No-op quantizer used to measure the autoencoder reconstruction floor."""
+
+  def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    indices = torch.zeros(
+        z.shape[0], z.shape[2], dtype=torch.long, device=z.device
+    )
+    return z, z.sum() * 0.0, indices
+
+
 class TrajectoryVQVAE(nn.Module):
   """Small temporal convolutional quantized autoencoder for [B, T, 2] trajectories."""
 
@@ -290,6 +300,9 @@ class TrajectoryVQVAE(nn.Module):
     elif quantizer == "fsq":
       self.quantizer = FiniteScalarQuantizer(fsq_levels, code_dim)
       self.quantizer_bins = self.quantizer.num_bins
+    elif quantizer == "none":
+      self.quantizer = IdentityQuantizer()
+      self.quantizer_bins = 1
     else:
       raise ValueError(f"Unknown quantizer: {quantizer}")
     self.decoder = nn.Sequential(
@@ -601,7 +614,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--hidden-dim", type=int, default=64)
   parser.add_argument("--code-dim", type=int, default=32)
   parser.add_argument("--num-codes", type=int, default=64)
-  parser.add_argument("--quantizer", choices=("vq", "fsq"), default="vq")
+  parser.add_argument("--quantizer", choices=("vq", "fsq", "none"), default="vq")
   parser.add_argument(
       "--fsq-levels",
       type=int,
