@@ -234,7 +234,7 @@ class VectorQuantizer(nn.Module):
 class FiniteScalarQuantizer(nn.Module):
   """Straight-through finite scalar quantizer for channel-wise latent bins."""
 
-  def __init__(self, levels: list[int], code_dim: int):
+  def __init__(self, levels: list[int], code_dim: int, input_scale: float):
     super().__init__()
     if len(levels) == 1:
       levels = levels * code_dim
@@ -247,18 +247,36 @@ class FiniteScalarQuantizer(nn.Module):
     levels_tensor = torch.tensor(levels, dtype=torch.float32)
     self.register_buffer("levels", levels_tensor)
     self.register_buffer("scale", levels_tensor - 1.0)
+    self.log_input_scale = nn.Parameter(
+        torch.full((code_dim,), math.log(input_scale), dtype=torch.float32)
+    )
+    self.input_offset = nn.Parameter(torch.zeros(code_dim, dtype=torch.float32))
 
   @property
   def num_bins(self) -> int:
     return int(self.levels.max().item())
 
-  def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  def project(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     z_bt = z.permute(0, 2, 1).contiguous()
     scale = self.scale.view(1, 1, -1)
-    bounded = (torch.tanh(z_bt) + 1.0) * 0.5 * scale
+    input_scale = self.log_input_scale.exp().view(1, 1, -1)
+    input_offset = self.input_offset.view(1, 1, -1)
+    adapted = z_bt * input_scale + input_offset
+    continuous = torch.tanh(adapted)
+    bounded = (continuous + 1.0) * 0.5 * scale
+    return adapted, continuous, bounded
+
+  def forward(
+      self, z: torch.Tensor, quantize_strength: float = 1.0
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    z_bt = z.permute(0, 2, 1).contiguous()
+    scale = self.scale.view(1, 1, -1)
+    _, continuous, bounded = self.project(z)
     indices = torch.round(bounded).long()
     quantized = (indices.float() / scale) * 2.0 - 1.0
-    quantized = z_bt + (quantized - z_bt).detach()
+    quantized = continuous + (quantized - continuous).detach()
+    if quantize_strength < 1.0:
+      quantized = (1.0 - quantize_strength) * continuous + quantize_strength * quantized
     zero_loss = z.sum() * 0.0
     return quantized.permute(0, 2, 1).contiguous(), zero_loss, indices
 
@@ -266,7 +284,9 @@ class FiniteScalarQuantizer(nn.Module):
 class IdentityQuantizer(nn.Module):
   """No-op quantizer used to measure the autoencoder reconstruction floor."""
 
-  def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  def forward(
+      self, z: torch.Tensor, quantize_strength: float = 1.0
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     indices = torch.zeros(
         z.shape[0], z.shape[2], dtype=torch.long, device=z.device
     )
@@ -283,6 +303,7 @@ class TrajectoryVQVAE(nn.Module):
       num_codes: int,
       quantizer: str,
       fsq_levels: list[int],
+      fsq_input_scale: float,
       vq_loss_mode: str,
   ):
     super().__init__()
@@ -298,7 +319,9 @@ class TrajectoryVQVAE(nn.Module):
       self.quantizer = VectorQuantizer(num_codes, code_dim, vq_loss_mode)
       self.quantizer_bins = num_codes
     elif quantizer == "fsq":
-      self.quantizer = FiniteScalarQuantizer(fsq_levels, code_dim)
+      self.quantizer = FiniteScalarQuantizer(
+          fsq_levels, code_dim, fsq_input_scale
+      )
       self.quantizer_bins = self.quantizer.num_bins
     elif quantizer == "none":
       self.quantizer = IdentityQuantizer()
@@ -313,9 +336,14 @@ class TrajectoryVQVAE(nn.Module):
         nn.Conv1d(hidden_dim, 2, kernel_size=5, padding=2),
     )
 
-  def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  def forward(
+      self, x: torch.Tensor, quantize_strength: float = 1.0
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     z = self.encoder(x.permute(0, 2, 1))
-    quantized, vq_loss, indices = self.quantizer(z)
+    if self.quantizer_type == "fsq":
+      quantized, vq_loss, indices = self.quantizer(z, quantize_strength)
+    else:
+      quantized, vq_loss, indices = self.quantizer(z)
     recon = self.decoder(quantized).permute(0, 2, 1)
     return recon[:, : x.shape[1]], vq_loss, indices
 
@@ -333,6 +361,7 @@ def save_reconstruction_plot(
     device: torch.device,
     output_dir: Path,
     epoch: int,
+    quantize_strength: float = 1.0,
 ) -> Path:
   """Saves target/reconstruction plots for representative training samples."""
   import matplotlib
@@ -351,7 +380,7 @@ def save_reconstruction_plot(
 
   sample_x = x[sample_indices].to(device)
   with torch.no_grad():
-    recon, _, token_indices = model(sample_x)
+    recon, _, token_indices = model(sample_x, quantize_strength=quantize_strength)
 
   mean = mean.to(device)
   std = std.to(device)
@@ -371,7 +400,10 @@ def save_reconstruction_plot(
     axis.set_aspect("equal", adjustable="box")
     axis.grid(True, alpha=0.3)
   axes[0, 0].legend(loc="best")
-  fig.suptitle(f"Waymo trajectory VQ-VAE reconstruction, epoch {epoch}")
+  fig.suptitle(
+      f"Waymo trajectory VQ-VAE reconstruction, epoch {epoch}, "
+      f"quantize_strength={quantize_strength:.2f}"
+  )
   fig.tight_layout()
   output_path = output_dir / f"reconstruction_epoch_{epoch:04d}.png"
   fig.savefig(output_path, dpi=150)
@@ -467,6 +499,55 @@ def codebook_perplexity(indices: torch.Tensor, num_codes: int) -> float:
   return float(torch.exp(entropy))
 
 
+def quantize_strength_for_epoch(args: argparse.Namespace, epoch: int) -> float:
+  if args.quantizer != "fsq":
+    return 1.0
+  if epoch <= args.quantize_warmup_epochs:
+    return 0.0
+  if args.quantize_anneal_epochs <= 0:
+    return 1.0
+  progress = (epoch - args.quantize_warmup_epochs) / args.quantize_anneal_epochs
+  return min(1.0, max(0.0, progress))
+
+
+def tensor_stats(name: str, value: torch.Tensor) -> str:
+  value = value.detach().float().cpu()
+  return (
+      f"{name}_mean={value.mean().item():.4f} "
+      f"{name}_std={value.std().item():.4f} "
+      f"{name}_min={value.min().item():.4f} "
+      f"{name}_max={value.max().item():.4f}"
+  )
+
+
+def fsq_latent_stats(
+    model: nn.Module,
+    sample_x: torch.Tensor,
+    num_bins: int,
+) -> str:
+  if not isinstance(getattr(model, "quantizer", None), FiniteScalarQuantizer):
+    return ""
+  model.eval()
+  with torch.no_grad():
+    z = model.encoder(sample_x.permute(0, 2, 1))
+    adapted, continuous, bounded = model.quantizer.project(z)
+    indices = torch.round(bounded).long().cpu()
+    input_scale = model.quantizer.log_input_scale.exp().detach().float().cpu()
+  return (
+      tensor_stats("z", z)
+      + " "
+      + tensor_stats("adapted", adapted)
+      + " "
+      + tensor_stats("tanh", continuous)
+      + " "
+      + f"input_scale_mean={input_scale.mean().item():.4f} "
+      + f"input_scale_min={input_scale.min().item():.4f} "
+      + f"input_scale_max={input_scale.max().item():.4f} "
+      + f"sample_unique_bins={len(torch.unique(indices))} "
+      + f"sample_perplexity={codebook_perplexity(indices, num_bins):.2f}"
+  )
+
+
 def select_device(device_arg: str) -> torch.device:
   if device_arg == "auto":
     if torch.backends.mps.is_available():
@@ -496,12 +577,14 @@ def train(args: argparse.Namespace) -> None:
 
   dataset = TensorDataset(x, labels)
   loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+  latent_stats_x = x[: min(args.latent_stats_samples, len(x))].to(device)
   model = TrajectoryVQVAE(
       hidden_dim=args.hidden_dim,
       code_dim=args.code_dim,
       num_codes=args.num_codes,
       quantizer=args.quantizer,
       fsq_levels=args.fsq_levels,
+      fsq_input_scale=args.fsq_input_scale,
       vq_loss_mode=args.vq_loss_mode,
   ).to(device)
   optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -512,6 +595,7 @@ def train(args: argparse.Namespace) -> None:
   metrics = []
 
   for epoch in range(1, args.epochs + 1):
+    quantize_strength = quantize_strength_for_epoch(args, epoch)
     model.train()
     total_recon = 0.0
     total_pos = 0.0
@@ -520,7 +604,9 @@ def train(args: argparse.Namespace) -> None:
     last_indices = None
     for batch_x, _ in loader:
       batch_x = batch_x.to(device)
-      recon, vq_loss, indices = model(batch_x)
+      recon, vq_loss, indices = model(
+          batch_x, quantize_strength=quantize_strength
+      )
       recon_loss = F.smooth_l1_loss(recon, batch_x)
       pos_loss = absolute_position_loss(recon, batch_x, mean, std)
       loss = recon_loss + args.position_loss_weight * pos_loss + vq_loss
@@ -541,6 +627,7 @@ def train(args: argparse.Namespace) -> None:
         "pos_loss": total_pos / batches,
         "vq": total_vq / batches,
         "perplexity": perplexity,
+        "quantize_strength": quantize_strength,
     }
     metrics.append(epoch_metrics)
 
@@ -550,7 +637,16 @@ def train(args: argparse.Namespace) -> None:
           f"recon={epoch_metrics['recon']:.5f} "
           f"pos_loss={epoch_metrics['pos_loss']:.5f} "
           f"vq={epoch_metrics['vq']:.5f} "
-          f"last_batch_perplexity={perplexity:.2f}"
+          f"last_batch_perplexity={perplexity:.2f} "
+          f"quantize_strength={quantize_strength:.2f}"
+      )
+    if (
+        args.latent_stats_every > 0
+        and (epoch == 1 or epoch % args.latent_stats_every == 0 or epoch == args.epochs)
+    ):
+      print(
+          f"latent_stats epoch={epoch:04d} "
+          + fsq_latent_stats(model, latent_stats_x, model.quantizer_bins)
       )
     if args.plot_every > 0 and (
         epoch == 1 or epoch % args.plot_every == 0 or epoch == args.epochs
@@ -565,6 +661,7 @@ def train(args: argparse.Namespace) -> None:
               device=device,
               output_dir=Path(args.plot_dir),
               epoch=epoch,
+              quantize_strength=quantize_strength,
           )
       )
 
@@ -625,10 +722,40 @@ def parse_args() -> argparse.Namespace:
           "all code_dim channels; otherwise the list must match code_dim."
       ),
   )
+  parser.add_argument(
+      "--fsq-input-scale",
+      type=float,
+      default=0.1,
+      help="Initial learnable input scale applied before FSQ tanh quantization.",
+  )
+  parser.add_argument(
+      "--quantize-warmup-epochs",
+      type=int,
+      default=0,
+      help="For FSQ, train with continuous tanh latents for this many epochs.",
+  )
+  parser.add_argument(
+      "--quantize-anneal-epochs",
+      type=int,
+      default=0,
+      help="For FSQ, linearly blend continuous latents into quantized latents.",
+  )
   parser.add_argument("--vq-loss-mode", choices=("single", "split"), default="single")
   parser.add_argument("--position-loss-weight", type=float, default=0.0)
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--log-every", type=int, default=5)
+  parser.add_argument(
+      "--latent-stats-every",
+      type=int,
+      default=0,
+      help="For FSQ, print encoder/pre-tanh/bin usage stats every N epochs.",
+  )
+  parser.add_argument(
+      "--latent-stats-samples",
+      type=int,
+      default=64,
+      help="Number of fixed samples to use for latent stats.",
+  )
   parser.add_argument(
       "--plot-every",
       type=int,
