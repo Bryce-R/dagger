@@ -122,6 +122,27 @@
     </tbody>
   </table>
 
+  <h2>Traceback Commands</h2>
+  <p>Long MLP FSQ MPS run with 10-example reconstruction plots:</p>
+  <pre><code>env PYTHONUNBUFFERED=1 MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/private/tmp python train_waymo_trajectory_vqvae.py \
+  --tfrecord /Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000 \
+  --architecture mlp \
+  --hidden-dim 512 \
+  --code-dim 64 \
+  --mlp-latent-tokens 1 \
+  --fsq-levels 256 \
+  --fsq-input-scale 0.1 \
+  --position-loss-weight 10 \
+  --plot-every 1000 \
+  --num-plot-samples 10 \
+  --log-every 1000 \
+  --latent-stats-every 1000 \
+  --quantizer fsq \
+  --device mps \
+  --epochs 12000 \
+  --batch-size 512 \
+  --plot-dir waymo_full_mlp_fsq256_affine_mps_h512_cd64_tok1_posw10_e12000_b512_plots1000_10examples</code></pre>
+
   <h2>CPU vs MPS Diagnostic</h2>
   <table>
     <thead>

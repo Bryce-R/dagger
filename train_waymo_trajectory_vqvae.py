@@ -53,6 +53,7 @@ TRACK_TYPE_NAMES = {
     3: "cyclist",
     4: "other",
 }
+WAYMO_STEPS_PER_SECOND = 10
 
 
 def ensure_waymo_scenario_pb2():
@@ -125,12 +126,19 @@ def rotate_to_local(xy: torch.Tensor, heading: float) -> torch.Tensor:
   return xy @ rot.T
 
 
+def wrap_angle(angle: torch.Tensor) -> torch.Tensor:
+  """Wraps radians to [-pi, pi]."""
+  return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
 def extract_waymo_trajectories(
     tfrecord_paths: list[Path],
     num_steps: int,
     max_trajectories: int | None,
     include_all_valid_tracks: bool,
     object_types: set[int],
+    include_yaw: bool,
+    include_all_states: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
   """Returns normalized delta trajectories and labels from Waymo scenarios."""
   scenario_pb2 = ensure_waymo_scenario_pb2()
@@ -172,6 +180,24 @@ def extract_waymo_trajectories(
         xy = rotate_to_local(xy, states[0].heading)
         deltas = torch.zeros_like(xy)
         deltas[1:] = xy[1:] - xy[:-1]
+        if include_yaw or include_all_states:
+          headings = torch.tensor([state.heading for state in states], dtype=torch.float32)
+          local_yaw = wrap_angle(headings - headings[:1])
+          yaw_deltas = torch.zeros(num_steps, 1, dtype=torch.float32)
+          yaw_deltas[1:, 0] = wrap_angle(local_yaw[1:] - local_yaw[:-1])
+          deltas = torch.cat([deltas, yaw_deltas], dim=1)
+        if include_all_states:
+          z = torch.tensor([[state.center_z] for state in states], dtype=torch.float32)
+          z = z - z[:1]
+          z_deltas = torch.zeros_like(z)
+          z_deltas[1:] = z[1:] - z[:-1]
+          velocity = torch.tensor(
+              [(state.velocity_x, state.velocity_y) for state in states],
+              dtype=torch.float32,
+          )
+          velocity = rotate_to_local(velocity, states[0].heading)
+          state_features = torch.cat([z_deltas, velocity], dim=1)
+          deltas = torch.cat([deltas, state_features], dim=1)
         trajectories.append(deltas)
         labels.append(track.object_type)
         stats["valid_trajectories"] += 1
@@ -294,21 +320,23 @@ class IdentityQuantizer(nn.Module):
 
 
 class MLPEncoder(nn.Module):
-  """Flattened fixed-horizon trajectory encoder for [B, T, 2] inputs."""
+  """Flattened fixed-horizon trajectory encoder for [B, T, D] inputs."""
 
   def __init__(
       self,
       num_steps: int,
+      input_dim: int,
       hidden_dim: int,
       code_dim: int,
       latent_tokens: int,
   ):
     super().__init__()
     self.num_steps = num_steps
+    self.input_dim = input_dim
     self.code_dim = code_dim
     self.latent_tokens = latent_tokens
     self.net = nn.Sequential(
-        nn.Linear(num_steps * 2, hidden_dim),
+        nn.Linear(num_steps * input_dim, hidden_dim),
         nn.ReLU(),
         nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
@@ -316,7 +344,7 @@ class MLPEncoder(nn.Module):
     )
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    flat = x.reshape(x.shape[0], self.num_steps * 2)
+    flat = x.reshape(x.shape[0], self.num_steps * self.input_dim)
     z = self.net(flat)
     return z.view(x.shape[0], self.latent_tokens, self.code_dim).permute(0, 2, 1)
 
@@ -327,23 +355,25 @@ class MLPDecoder(nn.Module):
   def __init__(
       self,
       num_steps: int,
+      output_dim: int,
       hidden_dim: int,
       code_dim: int,
       latent_tokens: int,
   ):
     super().__init__()
     self.num_steps = num_steps
+    self.output_dim = output_dim
     self.net = nn.Sequential(
         nn.Linear(code_dim * latent_tokens, hidden_dim),
         nn.ReLU(),
         nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
-        nn.Linear(hidden_dim, num_steps * 2),
+        nn.Linear(hidden_dim, num_steps * output_dim),
     )
 
   def forward(self, z: torch.Tensor) -> torch.Tensor:
     flat = z.permute(0, 2, 1).contiguous().view(z.shape[0], -1)
-    return self.net(flat).view(z.shape[0], self.num_steps, 2)
+    return self.net(flat).view(z.shape[0], self.num_steps, self.output_dim)
 
 
 class TrajectoryVQVAE(nn.Module):
@@ -353,6 +383,7 @@ class TrajectoryVQVAE(nn.Module):
       self,
       architecture: str,
       num_steps: int,
+      input_dim: int,
       hidden_dim: int,
       code_dim: int,
       mlp_latent_tokens: int,
@@ -366,7 +397,7 @@ class TrajectoryVQVAE(nn.Module):
     self.architecture = architecture
     if architecture == "conv":
       self.encoder = nn.Sequential(
-          nn.Conv1d(2, hidden_dim, kernel_size=5, padding=2),
+          nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2),
           nn.ReLU(),
           nn.Conv1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
           nn.ReLU(),
@@ -377,11 +408,15 @@ class TrajectoryVQVAE(nn.Module):
           nn.ReLU(),
           nn.ConvTranspose1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
           nn.ReLU(),
-          nn.Conv1d(hidden_dim, 2, kernel_size=5, padding=2),
+          nn.Conv1d(hidden_dim, input_dim, kernel_size=5, padding=2),
       )
     elif architecture == "mlp":
-      self.encoder = MLPEncoder(num_steps, hidden_dim, code_dim, mlp_latent_tokens)
-      self.decoder = MLPDecoder(num_steps, hidden_dim, code_dim, mlp_latent_tokens)
+      self.encoder = MLPEncoder(
+          num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens
+      )
+      self.decoder = MLPDecoder(
+          num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens
+      )
     else:
       raise ValueError(f"Unknown architecture: {architecture}")
     self.quantizer_type = quantizer
@@ -423,7 +458,13 @@ class TrajectoryVQVAE(nn.Module):
 
 
 def deltas_to_positions(deltas: torch.Tensor) -> torch.Tensor:
-  return torch.cumsum(deltas, dim=1)
+  return torch.cumsum(deltas[..., :2], dim=1)
+
+
+def deltas_to_yaw(deltas: torch.Tensor) -> torch.Tensor:
+  if deltas.shape[-1] < 3:
+    return torch.empty(*deltas.shape[:2], 0, device=deltas.device)
+  return wrap_angle(torch.cumsum(deltas[..., 2:3], dim=1))
 
 
 def save_reconstruction_plot(
@@ -436,6 +477,7 @@ def save_reconstruction_plot(
     output_dir: Path,
     epoch: int,
     quantize_strength: float = 1.0,
+    num_plot_samples: int = 10,
 ) -> Path:
   """Saves target/reconstruction plots for representative training samples."""
   import matplotlib
@@ -445,7 +487,7 @@ def save_reconstruction_plot(
 
   model.eval()
   output_dir.mkdir(parents=True, exist_ok=True)
-  num_samples = min(3, len(x))
+  num_samples = min(num_plot_samples, len(x))
   sample_indices = list(range(num_samples))
   sample_names = [
       f"{TRACK_TYPE_NAMES.get(int(labels[index]), str(int(labels[index])))} {index}"
@@ -458,22 +500,35 @@ def save_reconstruction_plot(
 
   mean = mean.to(device)
   std = std.to(device)
-  target_xy = deltas_to_positions(sample_x * std + mean).cpu()
-  recon_xy = deltas_to_positions(recon * std + mean).cpu()
+  target_delta = sample_x * std + mean
+  recon_delta = recon * std + mean
+  target_xy = deltas_to_positions(target_delta).cpu()
+  recon_xy = deltas_to_positions(recon_delta).cpu()
+  target_yaw = deltas_to_yaw(target_delta).cpu()
+  recon_yaw = deltas_to_yaw(recon_delta).cpu()
 
+  num_cols = min(5, len(sample_indices))
+  num_rows = math.ceil(len(sample_indices) / num_cols)
   fig, axes = plt.subplots(
-      1, len(sample_indices), figsize=(4 * len(sample_indices), 4), squeeze=False
+      num_rows, num_cols, figsize=(4 * num_cols, 4 * num_rows), squeeze=False
   )
-  for axis, name, target, pred, tokens in zip(
-      axes[0], sample_names, target_xy, recon_xy, token_indices.cpu()
+  flat_axes = axes.ravel()
+  for axis, name, target, pred, target_heading, pred_heading, tokens in zip(
+      flat_axes, sample_names, target_xy, recon_xy, target_yaw, recon_yaw, token_indices.cpu()
   ):
     axis.plot(target[:, 0], target[:, 1], label="target", linewidth=2)
     axis.plot(pred[:, 0], pred[:, 1], label="recon", linewidth=2, linestyle="--")
     axis.scatter(target[0, 0], target[0, 1], s=20, marker="o", color="black")
-    axis.set_title(f"{name}: {len(torch.unique(tokens))} codes")
+    if target_heading.numel() > 0:
+      yaw_mae = (target_heading - pred_heading).abs().mean().item()
+      axis.set_title(f"{name}: {len(torch.unique(tokens))} codes, yaw_mae={yaw_mae:.2f}")
+    else:
+      axis.set_title(f"{name}: {len(torch.unique(tokens))} codes")
     axis.set_aspect("equal", adjustable="box")
     axis.grid(True, alpha=0.3)
-  axes[0, 0].legend(loc="best")
+  for axis in flat_axes[len(sample_indices):]:
+    axis.axis("off")
+  flat_axes[0].legend(loc="best")
   fig.suptitle(
       f"Waymo trajectory VQ-VAE reconstruction, epoch {epoch}, "
       f"quantize_strength={quantize_strength:.2f}"
@@ -566,6 +621,42 @@ def absolute_position_loss(
   return F.smooth_l1_loss(recon_xy, target_xy)
 
 
+def max_abs_position_error_by_second(
+    model: nn.Module,
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    steps_per_second: int = WAYMO_STEPS_PER_SECOND,
+) -> dict[int, float]:
+  """Returns worst absolute XY reconstruction error at each whole second."""
+  num_steps = x.shape[1]
+  max_seconds = math.ceil(num_steps / steps_per_second)
+  second_to_index = {
+      second: min(second * steps_per_second - 1, num_steps - 1)
+      for second in range(1, max_seconds + 1)
+  }
+  max_errors = {second: 0.0 for second in second_to_index}
+  mean = mean.to(device)
+  std = std.to(device)
+  loader = DataLoader(TensorDataset(x), batch_size=batch_size, shuffle=False)
+
+  model.eval()
+  with torch.no_grad():
+    for (batch_x,) in loader:
+      batch_x = batch_x.to(device)
+      recon, _, _ = model(batch_x)
+      recon_xy = deltas_to_positions(recon * std + mean)
+      target_xy = deltas_to_positions(batch_x * std + mean)
+      abs_error = (recon_xy - target_xy).abs()
+      for second, index in second_to_index.items():
+        max_errors[second] = max(
+            max_errors[second], float(abs_error[:, index].max().detach().cpu())
+        )
+  return max_errors
+
+
 def codebook_perplexity(indices: torch.Tensor, num_codes: int) -> float:
   counts = torch.bincount(indices.reshape(-1), minlength=num_codes).float()
   probs = counts / counts.sum().clamp_min(1.0)
@@ -641,6 +732,8 @@ def train(args: argparse.Namespace) -> None:
       max_trajectories=args.max_trajectories,
       include_all_valid_tracks=args.include_all_valid_tracks,
       object_types=set(args.object_type),
+      include_yaw=args.include_yaw,
+      include_all_states=args.include_all_states,
   )
   label_counts = {
       TRACK_TYPE_NAMES.get(int(label), str(int(label))): int((labels == label).sum())
@@ -655,6 +748,7 @@ def train(args: argparse.Namespace) -> None:
   model = TrajectoryVQVAE(
       architecture=args.architecture,
       num_steps=args.num_steps,
+      input_dim=x.shape[-1],
       hidden_dim=args.hidden_dim,
       code_dim=args.code_dim,
       mlp_latent_tokens=args.mlp_latent_tokens,
@@ -739,6 +833,7 @@ def train(args: argparse.Namespace) -> None:
               output_dir=Path(args.plot_dir),
               epoch=epoch,
               quantize_strength=quantize_strength,
+              num_plot_samples=args.num_plot_samples,
           )
       )
 
@@ -757,6 +852,18 @@ def train(args: argparse.Namespace) -> None:
   print(f"Saved metrics CSV: {metrics_csv}")
   print(f"Saved metrics plot: {metrics_plot}")
   print(f"Saved metrics plot PDF: {metrics_plot_pdf}")
+  second_errors = max_abs_position_error_by_second(
+      model=model,
+      x=x,
+      mean=mean,
+      std=std,
+      device=device,
+      batch_size=args.batch_size,
+  )
+  formatted_second_errors = " ".join(
+      f"{second}s={error:.6f}" for second, error in second_errors.items()
+  )
+  print(f"Final max abs XY position error by second: {formatted_second_errors}")
 
   model.eval()
   with torch.no_grad():
@@ -775,6 +882,19 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--tfrecord", action="append", required=True)
   parser.add_argument("--epochs", type=int, default=20)
   parser.add_argument("--num-steps", type=int, default=50)
+  parser.add_argument(
+      "--include-yaw",
+      action="store_true",
+      help="Append local yaw delta as a third trajectory channel.",
+  )
+  parser.add_argument(
+      "--include-all-states",
+      action="store_true",
+      help=(
+          "Append yaw delta, z delta, and local velocity state channels "
+          "to the XY delta trajectory."
+      ),
+  )
   parser.add_argument("--max-trajectories", type=int, default=None)
   parser.add_argument("--include-all-valid-tracks", action="store_true")
   parser.add_argument(
@@ -850,6 +970,12 @@ def parse_args() -> argparse.Namespace:
       type=int,
       default=5,
       help="Save reconstruction plots every N epochs. Use 0 to disable.",
+  )
+  parser.add_argument(
+      "--num-plot-samples",
+      type=int,
+      default=10,
+      help="Number of representative trajectories to show in reconstruction plots.",
   )
   parser.add_argument("--plot-dir", default="waymo_trajectory_vqvae_plots")
   parser.add_argument(
