@@ -800,7 +800,7 @@ def parse_args() -> argparse.Namespace:
       help="Number of latent tokens used by the MLP architecture.",
   )
   parser.add_argument("--num-codes", type=int, default=64)
-  parser.add_argument("--quantizer", choices=("vq", "fsq", "none"), default="vq")
+  parser.add_argument("--quantizer", choices=("vq", "fsq", "none"), default="fsq")
   parser.add_argument(
       "--fsq-levels",
       type=int,
