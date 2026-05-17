@@ -293,13 +293,69 @@ class IdentityQuantizer(nn.Module):
     return z, z.sum() * 0.0, indices
 
 
-class TrajectoryVQVAE(nn.Module):
-  """Small temporal convolutional quantized autoencoder for [B, T, 2] trajectories."""
+class MLPEncoder(nn.Module):
+  """Flattened fixed-horizon trajectory encoder for [B, T, 2] inputs."""
 
   def __init__(
       self,
+      num_steps: int,
       hidden_dim: int,
       code_dim: int,
+      latent_tokens: int,
+  ):
+    super().__init__()
+    self.num_steps = num_steps
+    self.code_dim = code_dim
+    self.latent_tokens = latent_tokens
+    self.net = nn.Sequential(
+        nn.Linear(num_steps * 2, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, code_dim * latent_tokens),
+    )
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    flat = x.reshape(x.shape[0], self.num_steps * 2)
+    z = self.net(flat)
+    return z.view(x.shape[0], self.latent_tokens, self.code_dim).permute(0, 2, 1)
+
+
+class MLPDecoder(nn.Module):
+  """Flattened fixed-horizon trajectory decoder for quantized latents."""
+
+  def __init__(
+      self,
+      num_steps: int,
+      hidden_dim: int,
+      code_dim: int,
+      latent_tokens: int,
+  ):
+    super().__init__()
+    self.num_steps = num_steps
+    self.net = nn.Sequential(
+        nn.Linear(code_dim * latent_tokens, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, num_steps * 2),
+    )
+
+  def forward(self, z: torch.Tensor) -> torch.Tensor:
+    flat = z.permute(0, 2, 1).contiguous().view(z.shape[0], -1)
+    return self.net(flat).view(z.shape[0], self.num_steps, 2)
+
+
+class TrajectoryVQVAE(nn.Module):
+  """Quantized autoencoder for [B, T, 2] trajectories."""
+
+  def __init__(
+      self,
+      architecture: str,
+      num_steps: int,
+      hidden_dim: int,
+      code_dim: int,
+      mlp_latent_tokens: int,
       num_codes: int,
       quantizer: str,
       fsq_levels: list[int],
@@ -307,13 +363,27 @@ class TrajectoryVQVAE(nn.Module):
       vq_loss_mode: str,
   ):
     super().__init__()
-    self.encoder = nn.Sequential(
-        nn.Conv1d(2, hidden_dim, kernel_size=5, padding=2),
-        nn.ReLU(),
-        nn.Conv1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
-        nn.ReLU(),
-        nn.Conv1d(hidden_dim, code_dim, kernel_size=3, padding=1),
-    )
+    self.architecture = architecture
+    if architecture == "conv":
+      self.encoder = nn.Sequential(
+          nn.Conv1d(2, hidden_dim, kernel_size=5, padding=2),
+          nn.ReLU(),
+          nn.Conv1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
+          nn.ReLU(),
+          nn.Conv1d(hidden_dim, code_dim, kernel_size=3, padding=1),
+      )
+      self.decoder = nn.Sequential(
+          nn.Conv1d(code_dim, hidden_dim, kernel_size=3, padding=1),
+          nn.ReLU(),
+          nn.ConvTranspose1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
+          nn.ReLU(),
+          nn.Conv1d(hidden_dim, 2, kernel_size=5, padding=2),
+      )
+    elif architecture == "mlp":
+      self.encoder = MLPEncoder(num_steps, hidden_dim, code_dim, mlp_latent_tokens)
+      self.decoder = MLPDecoder(num_steps, hidden_dim, code_dim, mlp_latent_tokens)
+    else:
+      raise ValueError(f"Unknown architecture: {architecture}")
     self.quantizer_type = quantizer
     if quantizer == "vq":
       self.quantizer = VectorQuantizer(num_codes, code_dim, vq_loss_mode)
@@ -328,24 +398,28 @@ class TrajectoryVQVAE(nn.Module):
       self.quantizer_bins = 1
     else:
       raise ValueError(f"Unknown quantizer: {quantizer}")
-    self.decoder = nn.Sequential(
-        nn.Conv1d(code_dim, hidden_dim, kernel_size=3, padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose1d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
-        nn.ReLU(),
-        nn.Conv1d(hidden_dim, 2, kernel_size=5, padding=2),
-    )
+
+  def encode(self, x: torch.Tensor) -> torch.Tensor:
+    if self.architecture == "conv":
+      return self.encoder(x.permute(0, 2, 1))
+    return self.encoder(x)
+
+  def decode(self, z: torch.Tensor, num_steps: int) -> torch.Tensor:
+    if self.architecture == "conv":
+      recon = self.decoder(z).permute(0, 2, 1)
+      return recon[:, :num_steps]
+    return self.decoder(z)
 
   def forward(
       self, x: torch.Tensor, quantize_strength: float = 1.0
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    z = self.encoder(x.permute(0, 2, 1))
+    z = self.encode(x)
     if self.quantizer_type == "fsq":
       quantized, vq_loss, indices = self.quantizer(z, quantize_strength)
     else:
       quantized, vq_loss, indices = self.quantizer(z)
-    recon = self.decoder(quantized).permute(0, 2, 1)
-    return recon[:, : x.shape[1]], vq_loss, indices
+    recon = self.decode(quantized, x.shape[1])
+    return recon, vq_loss, indices
 
 
 def deltas_to_positions(deltas: torch.Tensor) -> torch.Tensor:
@@ -529,7 +603,7 @@ def fsq_latent_stats(
     return ""
   model.eval()
   with torch.no_grad():
-    z = model.encoder(sample_x.permute(0, 2, 1))
+    z = model.encode(sample_x)
     adapted, continuous, bounded = model.quantizer.project(z)
     indices = torch.round(bounded).long().cpu()
     input_scale = model.quantizer.log_input_scale.exp().detach().float().cpu()
@@ -579,8 +653,11 @@ def train(args: argparse.Namespace) -> None:
   loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
   latent_stats_x = x[: min(args.latent_stats_samples, len(x))].to(device)
   model = TrajectoryVQVAE(
+      architecture=args.architecture,
+      num_steps=args.num_steps,
       hidden_dim=args.hidden_dim,
       code_dim=args.code_dim,
+      mlp_latent_tokens=args.mlp_latent_tokens,
       num_codes=args.num_codes,
       quantizer=args.quantizer,
       fsq_levels=args.fsq_levels,
@@ -708,8 +785,20 @@ def parse_args() -> argparse.Namespace:
       help="Object type to include. Defaults to vehicle=1; repeat to include more.",
   )
   parser.add_argument("--batch-size", type=int, default=128)
+  parser.add_argument(
+      "--architecture",
+      choices=("conv", "mlp"),
+      default="conv",
+      help="Autoencoder architecture. Conv preserves the original temporal model.",
+  )
   parser.add_argument("--hidden-dim", type=int, default=64)
   parser.add_argument("--code-dim", type=int, default=32)
+  parser.add_argument(
+      "--mlp-latent-tokens",
+      type=int,
+      default=1,
+      help="Number of latent tokens used by the MLP architecture.",
+  )
   parser.add_argument("--num-codes", type=int, default=64)
   parser.add_argument("--quantizer", choices=("vq", "fsq", "none"), default="vq")
   parser.add_argument(

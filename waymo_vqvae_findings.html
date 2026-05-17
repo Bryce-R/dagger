@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Waymo Trajectory VQ-VAE Findings</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 40px; line-height: 1.45; color: #1f2933; }
+    h1, h2 { color: #111827; }
+    code, pre { background: #f3f4f6; border-radius: 4px; }
+    code { padding: 1px 4px; }
+    pre { padding: 12px; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; margin: 16px 0 28px; }
+    th, td { border: 1px solid #d1d5db; padding: 8px 10px; text-align: left; }
+    th { background: #f9fafb; }
+    .ok { color: #047857; font-weight: 600; }
+    .bad { color: #b91c1c; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Waymo Trajectory VQ-VAE Findings</h1>
+  <p>
+    This captures the local experiment state for later sessions. The dataset used
+    was <code>/Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000</code>,
+    extracting 1620 valid vehicle trajectories of shape <code>[50, 2]</code>.
+  </p>
+
+  <h2>Best Results</h2>
+  <table>
+    <thead>
+      <tr><th>Run</th><th>Device</th><th>Best position loss</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>waymo_full_none_cd64_h128_posw10_e3000_b512</code></td>
+        <td>CPU</td>
+        <td class="ok">0.000210 @ epoch 2925</td>
+        <td>Unquantized autoencoder; proves encoder/decoder can hit the target.</td>
+      </tr>
+      <tr>
+        <td><code>waymo_full_fsq256_learned_affine_cd64_h128_posw10_e3000_b512_plots100</code></td>
+        <td>CPU</td>
+        <td class="ok">0.000445 @ epoch 2900</td>
+        <td>FSQ with learnable pre-tanh scale/offset; main successful discrete result.</td>
+      </tr>
+      <tr>
+        <td><code>waymo_full_fsq256_anneal_affine_cd64_h128_posw10_e3000_b512_plots100</code></td>
+        <td>CPU</td>
+        <td class="ok">0.000486 @ epoch 2909</td>
+        <td>Annealing helped final epoch stability, but best epoch was similar to no anneal.</td>
+      </tr>
+      <tr>
+        <td><code>waymo_full_fsq256_learned_affine_mps_cd64_h128_posw10_e9000_b512_plots500</code></td>
+        <td>MPS</td>
+        <td class="bad">0.088646 @ epoch 8955</td>
+        <td>Fast but much worse than CPU with the same hyperparameters.</td>
+      </tr>
+      <tr>
+        <td><code>waymo_full_mlp_fsq256_affine_cpu_h512_cd64_tok1_posw10_e3000_b512_plots300</code></td>
+        <td>CPU</td>
+        <td>0.002814 @ epoch 2565</td>
+        <td>MLP architecture; stable, but worse than Conv CPU.</td>
+      </tr>
+      <tr>
+        <td><code>waymo_full_mlp_fsq256_affine_mps_h512_cd64_tok1_posw10_e3000_b512_plots300</code></td>
+        <td>MPS</td>
+        <td>0.002790 @ epoch 2871</td>
+        <td>MLP avoids the Conv MPS latent explosion and nearly matches CPU MLP.</td>
+      </tr>
+      <tr>
+        <td><code>waymo_full_mlp_fsq256_affine_mps_h512_cd64_tok1_posw10_e12000_b512_plots1000</code></td>
+        <td>MPS</td>
+        <td class="ok">0.000657 @ epoch 11841</td>
+        <td>Longer MLP MPS run crosses the target with stable latent stats.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Key Findings</h2>
+  <ul>
+    <li>The original VQ baseline reached only <code>pos_loss ~= 0.147</code> at best after 10k epochs.</li>
+    <li>Plain FSQ collapsed without a learnable pre-tanh affine adapter; effective bin perplexity stayed around <code>~2</code>.</li>
+    <li>Adding learnable FSQ input scale/offset fixed the collapse on CPU and reached the <code>&lt; 0.001</code> target.</li>
+    <li>Annealing quantization is not the main win. The learned affine adapter is the main win.</li>
+    <li>MPS is available only outside the sandbox. It trains much faster but follows a different optimization path.</li>
+    <li>The MLP architecture removes the large CPU/MPS gap seen with Conv1D, but it does not yet beat the best Conv CPU run.</li>
+  </ul>
+
+  <h2>MLP Architecture Comparison</h2>
+  <table>
+    <thead>
+      <tr><th>Run</th><th>Device</th><th>Best position loss</th><th>Final position loss</th><th>Perplexity</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>MLP, hidden 512, code dim 64, 1 token</td>
+        <td>CPU</td>
+        <td>0.002814 @ epoch 2565</td>
+        <td>0.003215</td>
+        <td>107.70 best / 113.07 final</td>
+      </tr>
+      <tr>
+        <td>MLP, hidden 512, code dim 64, 1 token</td>
+        <td>MPS</td>
+        <td>0.002790 @ epoch 2871</td>
+        <td>0.015937</td>
+        <td>116.44 best / 114.68 final</td>
+      </tr>
+      <tr>
+        <td>MLP, hidden 512, code dim 64, 1 token, 12k epochs</td>
+        <td>MPS</td>
+        <td class="ok">0.000657 @ epoch 11841</td>
+        <td>0.000806</td>
+        <td>129.93 best / 121.91 final</td>
+      </tr>
+      <tr>
+        <td>Conv1D, hidden 128, code dim 64</td>
+        <td>CPU</td>
+        <td class="ok">0.000445 @ epoch 2900</td>
+        <td>0.001827</td>
+        <td>70.05 best / 73.31 final</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>CPU vs MPS Diagnostic</h2>
+  <table>
+    <thead>
+      <tr><th>Run</th><th>Epoch</th><th>pos_loss</th><th>z_std</th><th>adapted_std</th><th>tanh range</th><th>sample perplexity</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CPU, batch 512, lr 3e-4</td>
+        <td>600</td>
+        <td class="ok">0.00424</td>
+        <td>1.37</td>
+        <td>0.139</td>
+        <td>[-0.684, 0.759]</td>
+        <td>70.66</td>
+      </tr>
+      <tr>
+        <td>MPS, batch 512, lr 3e-4</td>
+        <td>600</td>
+        <td class="bad">0.43318</td>
+        <td>93.95</td>
+        <td>14.96</td>
+        <td>[-1.000, 1.000]</td>
+        <td>190.03</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    The diagnostic suggests MPS drives encoder latents to very large magnitude,
+    saturating <code>tanh</code> in FSQ. Smaller MPS batch size and smaller initial
+    FSQ input scale helped somewhat but did not close the CPU gap.
+  </p>
+
+  <h2>Recommended Next Experiments</h2>
+  <ol>
+    <li>Try larger or multi-token MLP latents, e.g. <code>--mlp-latent-tokens 2</code> or <code>4</code>.</li>
+    <li>Try direct position decoding/loss for MLP instead of reconstructing deltas and integrating with <code>cumsum</code>.</li>
+    <li>For Conv on MPS, add gradient clipping or latent regularization on encoder output / pre-tanh adapted values.</li>
+    <li>Add checkpoint saving before longer training runs, because current scripts save metrics and plots but not weights.</li>
+  </ol>
+</body>
+</html>
