@@ -332,6 +332,7 @@ class MLPEncoder(nn.Module):
       hidden_dim: int,
       code_dim: int,
       latent_tokens: int,
+      dropout: float,
   ):
     super().__init__()
     self.num_steps = num_steps
@@ -341,8 +342,10 @@ class MLPEncoder(nn.Module):
     self.net = nn.Sequential(
         nn.Linear(num_steps * input_dim, hidden_dim),
         nn.ReLU(),
+        nn.Dropout(dropout),
         nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
+        nn.Dropout(dropout),
         nn.Linear(hidden_dim, code_dim * latent_tokens),
     )
 
@@ -362,6 +365,7 @@ class MLPDecoder(nn.Module):
       hidden_dim: int,
       code_dim: int,
       latent_tokens: int,
+      dropout: float,
   ):
     super().__init__()
     self.num_steps = num_steps
@@ -369,8 +373,10 @@ class MLPDecoder(nn.Module):
     self.net = nn.Sequential(
         nn.Linear(code_dim * latent_tokens, hidden_dim),
         nn.ReLU(),
+        nn.Dropout(dropout),
         nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
+        nn.Dropout(dropout),
         nn.Linear(hidden_dim, num_steps * output_dim),
     )
 
@@ -390,6 +396,7 @@ class TrajectoryVQVAE(nn.Module):
       hidden_dim: int,
       code_dim: int,
       mlp_latent_tokens: int,
+      mlp_dropout: float,
       num_codes: int,
       quantizer: str,
       fsq_levels: list[int],
@@ -415,10 +422,10 @@ class TrajectoryVQVAE(nn.Module):
       )
     elif architecture == "mlp":
       self.encoder = MLPEncoder(
-          num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens
+          num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens, mlp_dropout
       )
       self.decoder = MLPDecoder(
-          num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens
+          num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens, mlp_dropout
       )
     else:
       raise ValueError(f"Unknown architecture: {architecture}")
@@ -829,13 +836,16 @@ def train(args: argparse.Namespace) -> None:
       hidden_dim=args.hidden_dim,
       code_dim=args.code_dim,
       mlp_latent_tokens=args.mlp_latent_tokens,
+      mlp_dropout=args.mlp_dropout,
       num_codes=args.num_codes,
       quantizer=args.quantizer,
       fsq_levels=args.fsq_levels,
       fsq_input_scale=args.fsq_input_scale,
       vq_loss_mode=args.vq_loss_mode,
   ).to(device)
-  optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+  optimizer = torch.optim.AdamW(
+      model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+  )
   saved_plot_paths = []
   pdf_path = None
   if args.plot_every > 0:
@@ -1074,6 +1084,12 @@ def parse_args() -> argparse.Namespace:
       default=1,
       help="Number of latent tokens used by the MLP architecture.",
   )
+  parser.add_argument(
+      "--mlp-dropout",
+      type=float,
+      default=0.0,
+      help="Dropout probability applied after MLP hidden activations.",
+  )
   parser.add_argument("--num-codes", type=int, default=64)
   parser.add_argument("--quantizer", choices=("vq", "fsq", "none"), default="fsq")
   parser.add_argument(
@@ -1113,6 +1129,7 @@ def parse_args() -> argparse.Namespace:
       help="Fraction of extracted trajectories held out for validation metrics.",
   )
   parser.add_argument("--lr", type=float, default=3e-4)
+  parser.add_argument("--weight-decay", type=float, default=1e-4)
   parser.add_argument("--log-every", type=int, default=5)
   parser.add_argument(
       "--latent-stats-every",
