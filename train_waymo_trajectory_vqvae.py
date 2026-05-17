@@ -605,6 +605,10 @@ def save_metrics_plot(metrics: list[dict[str, float]], output_paths: list[Path])
   ]
   for axis, (key, title) in zip(axes.ravel(), plots):
     axis.plot(epochs, [row[key] for row in metrics], linewidth=1.8)
+    val_key = f"val_{key}"
+    if val_key in metrics[0]:
+      axis.plot(epochs, [row[val_key] for row in metrics], linewidth=1.8, linestyle="--")
+      axis.legend(["train", "val"], loc="best")
     axis.set_title(title)
     axis.set_xlabel("epoch")
     axis.grid(True, alpha=0.3)
@@ -630,6 +634,47 @@ def absolute_position_loss(
   recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
   target_xy = xy_to_positions(target * std + mean, decode_absolute_positions)
   return F.smooth_l1_loss(recon_xy, target_xy)
+
+
+def evaluate_reconstruction(
+    model: nn.Module,
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    decode_absolute_positions: bool,
+) -> dict[str, float]:
+  """Computes full-dataset reconstruction metrics without gradient updates."""
+  loader = DataLoader(TensorDataset(x), batch_size=batch_size, shuffle=False)
+  total_recon = 0.0
+  total_pos = 0.0
+  total_mse = 0.0
+  total_examples = 0
+
+  model.eval()
+  with torch.no_grad():
+    for (batch_x,) in loader:
+      batch_x = batch_x.to(device)
+      recon, _, _ = model(batch_x)
+      batch_size_actual = batch_x.shape[0]
+      total_recon += float(F.smooth_l1_loss(recon, batch_x).detach()) * batch_size_actual
+      total_pos += (
+          float(
+              absolute_position_loss(
+                  recon, batch_x, mean, std, decode_absolute_positions
+              ).detach()
+          )
+          * batch_size_actual
+      )
+      total_mse += float(F.mse_loss(recon, batch_x).detach()) * batch_size_actual
+      total_examples += batch_size_actual
+
+  return {
+      "recon": total_recon / total_examples,
+      "pos_loss": total_pos / total_examples,
+      "mse": total_mse / total_examples,
+  }
 
 
 def max_abs_position_error_by_second(
@@ -755,8 +800,27 @@ def train(args: argparse.Namespace) -> None:
   print(f"Parsed stats: {stats}")
   print(f"Trajectory tensor: {tuple(x.shape)} label_counts={label_counts}")
 
-  dataset = TensorDataset(x, labels)
-  loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+  split_generator = torch.Generator().manual_seed(args.seed)
+  permutation = torch.randperm(len(x), generator=split_generator)
+  val_size = int(round(len(x) * args.val_fraction))
+  if args.val_fraction > 0.0:
+    val_size = max(1, min(len(x) - 1, val_size))
+  train_indices = permutation[val_size:]
+  val_indices = permutation[:val_size]
+  train_x = x[train_indices]
+  train_labels = labels[train_indices]
+  val_x = x[val_indices] if val_size > 0 else x[:0]
+  val_labels = labels[val_indices] if val_size > 0 else labels[:0]
+  print(f"Split: train={len(train_x)} val={len(val_x)} val_fraction={args.val_fraction:.3f}")
+
+  train_dataset = TensorDataset(train_x, train_labels)
+  loader_generator = torch.Generator().manual_seed(args.seed)
+  loader = DataLoader(
+      train_dataset,
+      batch_size=args.batch_size,
+      shuffle=True,
+      generator=loader_generator,
+  )
   latent_stats_x = x[: min(args.latent_stats_samples, len(x))].to(device)
   model = TrajectoryVQVAE(
       architecture=args.architecture,
@@ -815,13 +879,38 @@ def train(args: argparse.Namespace) -> None:
         "perplexity": perplexity,
         "quantize_strength": quantize_strength,
     }
+    if len(val_x) > 0:
+      val_metrics = evaluate_reconstruction(
+          model=model,
+          x=val_x,
+          mean=mean,
+          std=std,
+          device=device,
+          batch_size=args.batch_size,
+          decode_absolute_positions=args.decode_absolute_positions,
+      )
+      epoch_metrics.update(
+          {
+              "val_recon": val_metrics["recon"],
+              "val_pos_loss": val_metrics["pos_loss"],
+              "val_mse": val_metrics["mse"],
+          }
+      )
     metrics.append(epoch_metrics)
 
     if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
+      val_log = ""
+      if len(val_x) > 0:
+        val_log = (
+            f" val_recon={epoch_metrics['val_recon']:.5f} "
+            f"val_pos_loss={epoch_metrics['val_pos_loss']:.5f} "
+            f"val_mse={epoch_metrics['val_mse']:.5f}"
+        )
       print(
           f"epoch={epoch:04d} "
           f"recon={epoch_metrics['recon']:.5f} "
           f"pos_loss={epoch_metrics['pos_loss']:.5f} "
+          f"{val_log} "
           f"vq={epoch_metrics['vq']:.5f} "
           f"last_batch_perplexity={perplexity:.2f} "
           f"quantize_strength={quantize_strength:.2f}"
@@ -881,6 +970,50 @@ def train(args: argparse.Namespace) -> None:
       f"{second}s={error:.6f}" for second, error in second_errors.items()
   )
   print(f"Final max abs XY position error by second: {formatted_second_errors}")
+  final_train_metrics = evaluate_reconstruction(
+      model=model,
+      x=train_x,
+      mean=mean,
+      std=std,
+      device=device,
+      batch_size=args.batch_size,
+      decode_absolute_positions=args.decode_absolute_positions,
+  )
+  print(
+      "Final train metrics: "
+      f"recon={final_train_metrics['recon']:.6f} "
+      f"pos_loss={final_train_metrics['pos_loss']:.6f} "
+      f"mse={final_train_metrics['mse']:.6f}"
+  )
+  if len(val_x) > 0:
+    final_val_metrics = evaluate_reconstruction(
+        model=model,
+        x=val_x,
+        mean=mean,
+        std=std,
+        device=device,
+        batch_size=args.batch_size,
+        decode_absolute_positions=args.decode_absolute_positions,
+    )
+    val_second_errors = max_abs_position_error_by_second(
+        model=model,
+        x=val_x,
+        mean=mean,
+        std=std,
+        device=device,
+        batch_size=args.batch_size,
+        decode_absolute_positions=args.decode_absolute_positions,
+    )
+    formatted_val_second_errors = " ".join(
+        f"{second}s={error:.6f}" for second, error in val_second_errors.items()
+    )
+    print(
+        "Final val metrics: "
+        f"recon={final_val_metrics['recon']:.6f} "
+        f"pos_loss={final_val_metrics['pos_loss']:.6f} "
+        f"mse={final_val_metrics['mse']:.6f}"
+    )
+    print(f"Final val max abs XY position error by second: {formatted_val_second_errors}")
 
   model.eval()
   with torch.no_grad():
@@ -973,6 +1106,12 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--vq-loss-mode", choices=("single", "split"), default="single")
   parser.add_argument("--position-loss-weight", type=float, default=0.0)
+  parser.add_argument(
+      "--val-fraction",
+      type=float,
+      default=0.2,
+      help="Fraction of extracted trajectories held out for validation metrics.",
+  )
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--log-every", type=int, default=5)
   parser.add_argument(
