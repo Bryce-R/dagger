@@ -83,7 +83,40 @@
     <li>Annealing quantization is not the main win. The learned affine adapter is the main win.</li>
     <li>MPS is available only outside the sandbox. It trains much faster but follows a different optimization path.</li>
     <li>The MLP architecture removes the large CPU/MPS gap seen with Conv1D, but it does not yet beat the best Conv CPU run.</li>
+    <li>Validation metrics show the MLP/FSQ runs overfit heavily. Same-data max-error results were optimistic before the train/val split.</li>
+    <li>For dynamic-state MLP runs, <code>--position-loss-weight 0</code> produced better same-data max-error tails than <code>10</code>, but validation still diverged.</li>
+    <li>Dropout regularization did not fix validation. Dropout <code>0.05</code> helped early validation at epoch 1000, but final validation degraded; dropout <code>0.2</code> underfit and was worse.</li>
   </ul>
+
+  <h2>Validation And Regularization</h2>
+  <table>
+    <thead>
+      <tr><th>Run</th><th>Train pos_loss</th><th>Val pos_loss</th><th>Val max error 1s / 2s / 3s / 4s / 5s</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Dynamic states, tok1, no dropout, posw0, 12k</td>
+        <td>0.001862</td>
+        <td class="bad">0.240642</td>
+        <td>7.132927 / 10.160489 / 11.661844 / 13.144597 / 17.224188</td>
+        <td>Strong train/val gap. Best val was much earlier, around epoch 1000.</td>
+      </tr>
+      <tr>
+        <td>Dynamic states, tok1, dropout 0.05, posw0, 12k</td>
+        <td>0.031031</td>
+        <td class="bad">0.604200</td>
+        <td>6.311144 / 12.977863 / 19.660332 / 26.354401 / 33.638718</td>
+        <td>Best early val_pos_loss seen so far at epoch 1000: 0.14897, then degraded.</td>
+      </tr>
+      <tr>
+        <td>Dynamic states, tok1, dropout 0.2, weight decay 1e-3, posw0, 12k</td>
+        <td>0.074976</td>
+        <td class="bad">0.851875</td>
+        <td>8.155590 / 16.761051 / 24.937088 / 33.041924 / 41.868263</td>
+        <td>Too much regularization; underfit and worse validation.</td>
+      </tr>
+    </tbody>
+  </table>
 
   <h2>MLP Architecture Comparison</h2>
   <table>
@@ -123,6 +156,30 @@
   </table>
 
   <h2>Traceback Commands</h2>
+  <p>
+    Current MLP-FSQ runner from 2026-05-17: use <code>train_waymo_mlp_fsq.py</code>.
+    It is a dedicated MLP + finite-scalar-quantization script and intentionally
+    does not expose the old VQ-VAE, Conv1D, no-quantizer, codebook, or VQ-loss
+    options.
+  </p>
+  <pre><code>env PYTHONUNBUFFERED=1 MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/private/tmp python train_waymo_mlp_fsq.py \
+  --tfrecord /Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000 \
+  --hidden-dim 512 \
+  --code-dim 64 \
+  --mlp-latent-tokens 1 \
+  --fsq-levels 256 \
+  --fsq-input-scale 0.1 \
+  --position-loss-weight 0 \
+  --plot-every 1000 \
+  --num-plot-samples 5 \
+  --log-every 1000 \
+  --latent-stats-every 1000 \
+  --device mps \
+  --epochs 12000 \
+  --batch-size 512 \
+  --include-all-states \
+  --val-fraction 0.2 \
+  --plot-dir waymo_mlp_fsq_dynamicstates_h512_cd64_tok1_posw0_e12000_b512</code></pre>
   <p>Long MLP FSQ MPS run with 10-example reconstruction plots:</p>
   <pre><code>env PYTHONUNBUFFERED=1 MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/private/tmp python train_waymo_trajectory_vqvae.py \
   --tfrecord /Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000 \
@@ -177,10 +234,10 @@
 
   <h2>Recommended Next Experiments</h2>
   <ol>
-    <li>Try larger or multi-token MLP latents, e.g. <code>--mlp-latent-tokens 2</code> or <code>4</code>.</li>
-    <li>Try direct position decoding/loss for MLP instead of reconstructing deltas and integrating with <code>cumsum</code>.</li>
-    <li>For Conv on MPS, add gradient clipping or latent regularization on encoder output / pre-tanh adapted values.</li>
-    <li>Add checkpoint saving before longer training runs, because current scripts save metrics and plots but not weights.</li>
+    <li>Add best-validation checkpointing / early stopping and evaluate the saved best epoch, not only final weights.</li>
+    <li>Try smaller MLP capacity, e.g. <code>--hidden-dim 128</code> or <code>256</code>, because validation suggests memorization.</li>
+    <li>Try data expansion: more Waymo shards and/or <code>--include-all-valid-tracks</code>.</li>
+    <li>Try lighter latent-capacity variants after checkpointing, e.g. <code>--code-dim 32</code> or lower FSQ levels.</li>
   </ol>
 </body>
 </html>
