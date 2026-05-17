@@ -139,6 +139,7 @@ def extract_waymo_trajectories(
     object_types: set[int],
     include_yaw: bool,
     include_all_states: bool,
+    decode_absolute_positions: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
   """Returns normalized delta trajectories and labels from Waymo scenarios."""
   scenario_pb2 = ensure_waymo_scenario_pb2()
@@ -180,6 +181,8 @@ def extract_waymo_trajectories(
         xy = rotate_to_local(xy, states[0].heading)
         deltas = torch.zeros_like(xy)
         deltas[1:] = xy[1:] - xy[:-1]
+        if decode_absolute_positions:
+          deltas = xy
         if include_yaw or include_all_states:
           headings = torch.tensor([state.heading for state in states], dtype=torch.float32)
           local_yaw = wrap_angle(headings - headings[:1])
@@ -461,6 +464,12 @@ def deltas_to_positions(deltas: torch.Tensor) -> torch.Tensor:
   return torch.cumsum(deltas[..., :2], dim=1)
 
 
+def xy_to_positions(xy_values: torch.Tensor, decode_absolute_positions: bool) -> torch.Tensor:
+  if decode_absolute_positions:
+    return xy_values[..., :2]
+  return deltas_to_positions(xy_values)
+
+
 def deltas_to_yaw(deltas: torch.Tensor) -> torch.Tensor:
   if deltas.shape[-1] < 3:
     return torch.empty(*deltas.shape[:2], 0, device=deltas.device)
@@ -478,6 +487,7 @@ def save_reconstruction_plot(
     epoch: int,
     quantize_strength: float = 1.0,
     num_plot_samples: int = 10,
+    decode_absolute_positions: bool = False,
 ) -> Path:
   """Saves target/reconstruction plots for representative training samples."""
   import matplotlib
@@ -502,8 +512,8 @@ def save_reconstruction_plot(
   std = std.to(device)
   target_delta = sample_x * std + mean
   recon_delta = recon * std + mean
-  target_xy = deltas_to_positions(target_delta).cpu()
-  recon_xy = deltas_to_positions(recon_delta).cpu()
+  target_xy = xy_to_positions(target_delta, decode_absolute_positions).cpu()
+  recon_xy = xy_to_positions(recon_delta, decode_absolute_positions).cpu()
   target_yaw = deltas_to_yaw(target_delta).cpu()
   recon_yaw = deltas_to_yaw(recon_delta).cpu()
 
@@ -613,11 +623,12 @@ def absolute_position_loss(
     target: torch.Tensor,
     mean: torch.Tensor,
     std: torch.Tensor,
+    decode_absolute_positions: bool,
 ) -> torch.Tensor:
   mean = mean.to(target.device)
   std = std.to(target.device)
-  recon_xy = deltas_to_positions(recon * std + mean)
-  target_xy = deltas_to_positions(target * std + mean)
+  recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
+  target_xy = xy_to_positions(target * std + mean, decode_absolute_positions)
   return F.smooth_l1_loss(recon_xy, target_xy)
 
 
@@ -628,6 +639,7 @@ def max_abs_position_error_by_second(
     std: torch.Tensor,
     device: torch.device,
     batch_size: int,
+    decode_absolute_positions: bool,
     steps_per_second: int = WAYMO_STEPS_PER_SECOND,
 ) -> dict[int, float]:
   """Returns worst absolute XY reconstruction error at each whole second."""
@@ -647,8 +659,8 @@ def max_abs_position_error_by_second(
     for (batch_x,) in loader:
       batch_x = batch_x.to(device)
       recon, _, _ = model(batch_x)
-      recon_xy = deltas_to_positions(recon * std + mean)
-      target_xy = deltas_to_positions(batch_x * std + mean)
+      recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
+      target_xy = xy_to_positions(batch_x * std + mean, decode_absolute_positions)
       abs_error = (recon_xy - target_xy).abs()
       for second, index in second_to_index.items():
         max_errors[second] = max(
@@ -734,6 +746,7 @@ def train(args: argparse.Namespace) -> None:
       object_types=set(args.object_type),
       include_yaw=args.include_yaw,
       include_all_states=args.include_all_states,
+      decode_absolute_positions=args.decode_absolute_positions,
   )
   label_counts = {
       TRACK_TYPE_NAMES.get(int(label), str(int(label))): int((labels == label).sum())
@@ -779,7 +792,9 @@ def train(args: argparse.Namespace) -> None:
           batch_x, quantize_strength=quantize_strength
       )
       recon_loss = F.smooth_l1_loss(recon, batch_x)
-      pos_loss = absolute_position_loss(recon, batch_x, mean, std)
+      pos_loss = absolute_position_loss(
+          recon, batch_x, mean, std, args.decode_absolute_positions
+      )
       loss = recon_loss + args.position_loss_weight * pos_loss + vq_loss
       optimizer.zero_grad(set_to_none=True)
       loss.backward()
@@ -834,6 +849,7 @@ def train(args: argparse.Namespace) -> None:
               epoch=epoch,
               quantize_strength=quantize_strength,
               num_plot_samples=args.num_plot_samples,
+              decode_absolute_positions=args.decode_absolute_positions,
           )
       )
 
@@ -859,6 +875,7 @@ def train(args: argparse.Namespace) -> None:
       std=std,
       device=device,
       batch_size=args.batch_size,
+      decode_absolute_positions=args.decode_absolute_positions,
   )
   formatted_second_errors = " ".join(
       f"{second}s={error:.6f}" for second, error in second_errors.items()
@@ -894,6 +911,11 @@ def parse_args() -> argparse.Namespace:
           "Append yaw delta, z delta, and local velocity state channels "
           "to the XY delta trajectory."
       ),
+  )
+  parser.add_argument(
+      "--decode-absolute-positions",
+      action="store_true",
+      help="Train the first two channels as local absolute XY positions instead of XY deltas.",
   )
   parser.add_argument("--max-trajectories", type=int, default=None)
   parser.add_argument("--include-all-valid-tracks", action="store_true")
