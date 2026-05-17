@@ -495,6 +495,7 @@ def save_reconstruction_plot(
     quantize_strength: float = 1.0,
     num_plot_samples: int = 10,
     decode_absolute_positions: bool = False,
+    split_name: str = "samples",
 ) -> Path:
   """Saves target/reconstruction plots for representative training samples."""
   import matplotlib
@@ -547,11 +548,11 @@ def save_reconstruction_plot(
     axis.axis("off")
   flat_axes[0].legend(loc="best")
   fig.suptitle(
-      f"Waymo trajectory VQ-VAE reconstruction, epoch {epoch}, "
+      f"Waymo trajectory VQ-VAE {split_name} reconstruction, epoch {epoch}, "
       f"quantize_strength={quantize_strength:.2f}"
   )
   fig.tight_layout()
-  output_path = output_dir / f"reconstruction_epoch_{epoch:04d}.png"
+  output_path = output_dir / f"reconstruction_{split_name}_epoch_{epoch:04d}.png"
   fig.savefig(output_path, dpi=150)
   plt.close(fig)
   return output_path
@@ -851,6 +852,9 @@ def train(args: argparse.Namespace) -> None:
   if args.plot_every > 0:
     pdf_path = Path(args.plot_pdf) if args.plot_pdf else Path(args.plot_dir) / "reconstructions.pdf"
   metrics = []
+  best_val_pos_loss = math.inf
+  best_val_epoch = 0
+  best_val_state = None
 
   for epoch in range(1, args.epochs + 1):
     quantize_strength = quantize_strength_for_epoch(args, epoch)
@@ -906,6 +910,13 @@ def train(args: argparse.Namespace) -> None:
               "val_mse": val_metrics["mse"],
           }
       )
+      if val_metrics["pos_loss"] < best_val_pos_loss:
+        best_val_pos_loss = val_metrics["pos_loss"]
+        best_val_epoch = epoch
+        best_val_state = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
     metrics.append(epoch_metrics)
 
     if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
@@ -939,8 +950,8 @@ def train(args: argparse.Namespace) -> None:
       saved_plot_paths.append(
           save_reconstruction_plot(
               model=model,
-              x=x,
-              labels=labels,
+              x=train_x,
+              labels=train_labels,
               mean=mean,
               std=std,
               device=device,
@@ -949,8 +960,26 @@ def train(args: argparse.Namespace) -> None:
               quantize_strength=quantize_strength,
               num_plot_samples=args.num_plot_samples,
               decode_absolute_positions=args.decode_absolute_positions,
+              split_name="train",
           )
       )
+      if len(val_x) > 0:
+        saved_plot_paths.append(
+            save_reconstruction_plot(
+                model=model,
+                x=val_x,
+                labels=val_labels,
+                mean=mean,
+                std=std,
+                device=device,
+                output_dir=Path(args.plot_dir),
+                epoch=epoch,
+                quantize_strength=quantize_strength,
+                num_plot_samples=args.num_plot_samples,
+                decode_absolute_positions=args.decode_absolute_positions,
+                split_name="val",
+            )
+        )
 
   if pdf_path is not None and saved_plot_paths:
     save_reconstruction_pdf(saved_plot_paths, pdf_path)
@@ -967,6 +996,7 @@ def train(args: argparse.Namespace) -> None:
   print(f"Saved metrics CSV: {metrics_csv}")
   print(f"Saved metrics plot: {metrics_plot}")
   print(f"Saved metrics plot PDF: {metrics_plot_pdf}")
+  active_model_label = "Final"
   second_errors = max_abs_position_error_by_second(
       model=model,
       x=x,
@@ -1024,6 +1054,70 @@ def train(args: argparse.Namespace) -> None:
         f"mse={final_val_metrics['mse']:.6f}"
     )
     print(f"Final val max abs XY position error by second: {formatted_val_second_errors}")
+    if best_val_state is not None:
+      model.load_state_dict(best_val_state)
+      best_checkpoint_path = Path(args.plot_dir) / "best_val_model.pt"
+      best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+      torch.save(
+          {
+              "model_state_dict": best_val_state,
+              "epoch": best_val_epoch,
+              "val_pos_loss": best_val_pos_loss,
+              "args": vars(args),
+          },
+          best_checkpoint_path,
+      )
+      best_train_metrics = evaluate_reconstruction(
+          model=model,
+          x=train_x,
+          mean=mean,
+          std=std,
+          device=device,
+          batch_size=args.batch_size,
+          decode_absolute_positions=args.decode_absolute_positions,
+      )
+      best_val_metrics = evaluate_reconstruction(
+          model=model,
+          x=val_x,
+          mean=mean,
+          std=std,
+          device=device,
+          batch_size=args.batch_size,
+          decode_absolute_positions=args.decode_absolute_positions,
+      )
+      best_val_second_errors = max_abs_position_error_by_second(
+          model=model,
+          x=val_x,
+          mean=mean,
+          std=std,
+          device=device,
+          batch_size=args.batch_size,
+          decode_absolute_positions=args.decode_absolute_positions,
+      )
+      formatted_best_val_second_errors = " ".join(
+          f"{second}s={error:.6f}" for second, error in best_val_second_errors.items()
+      )
+      print(
+          f"Best val checkpoint: epoch={best_val_epoch} "
+          f"path={best_checkpoint_path}"
+      )
+      print(
+          "Best val train metrics: "
+          f"recon={best_train_metrics['recon']:.6f} "
+          f"pos_loss={best_train_metrics['pos_loss']:.6f} "
+          f"mse={best_train_metrics['mse']:.6f}"
+      )
+      print(
+          "Best val metrics: "
+          f"recon={best_val_metrics['recon']:.6f} "
+          f"pos_loss={best_val_metrics['pos_loss']:.6f} "
+          f"mse={best_val_metrics['mse']:.6f}"
+      )
+      print(
+          "Best val max abs XY position error by second: "
+          f"{formatted_best_val_second_errors}"
+      )
+      active_model_label = "Best val"
 
   model.eval()
   with torch.no_grad():
@@ -1031,7 +1125,7 @@ def train(args: argparse.Namespace) -> None:
     recon, _, indices = model(sample_x)
     mse = F.mse_loss(recon, sample_x).item()
     used_codes = torch.unique(indices.cpu()).tolist()
-  print(f"Final sample MSE: {mse:.5f}")
+  print(f"{active_model_label} sample MSE: {mse:.5f}")
   print(f"Codes used by first {len(sample_x)} samples: {used_codes}")
 
 
@@ -1152,8 +1246,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
       "--num-plot-samples",
       type=int,
-      default=10,
-      help="Number of representative trajectories to show in reconstruction plots.",
+      default=5,
+      help="Number of representative train and validation trajectories to show in reconstruction plots.",
   )
   parser.add_argument("--plot-dir", default="waymo_trajectory_vqvae_plots")
   parser.add_argument(
