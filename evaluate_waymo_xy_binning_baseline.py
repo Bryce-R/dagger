@@ -139,6 +139,7 @@ def load_fsq_model(
       code_dim=checkpoint_args["code_dim"],
       mlp_latent_tokens=checkpoint_args["mlp_latent_tokens"],
       mlp_dropout=checkpoint_args["mlp_dropout"],
+      mlp_depth=checkpoint_args.get("mlp_depth", 2),
       fsq_levels=checkpoint_args["fsq_levels"],
       fsq_input_scale=checkpoint_args["fsq_input_scale"],
   ).to(device)

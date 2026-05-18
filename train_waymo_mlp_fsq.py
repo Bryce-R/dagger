@@ -298,21 +298,22 @@ class MLPEncoder(nn.Module):
       code_dim: int,
       latent_tokens: int,
       dropout: float,
+      depth: int,
   ):
     super().__init__()
+    if depth < 1:
+      raise ValueError("MLP depth must be at least 1.")
     self.num_steps = num_steps
     self.input_dim = input_dim
     self.code_dim = code_dim
     self.latent_tokens = latent_tokens
-    self.net = nn.Sequential(
-        nn.Linear(num_steps * input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(hidden_dim, code_dim * latent_tokens),
-    )
+    layers: list[nn.Module] = []
+    in_dim = num_steps * input_dim
+    for _ in range(depth):
+      layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)])
+      in_dim = hidden_dim
+    layers.append(nn.Linear(hidden_dim, code_dim * latent_tokens))
+    self.net = nn.Sequential(*layers)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     flat = x.reshape(x.shape[0], self.num_steps * self.input_dim)
@@ -331,19 +332,20 @@ class MLPDecoder(nn.Module):
       code_dim: int,
       latent_tokens: int,
       dropout: float,
+      depth: int,
   ):
     super().__init__()
+    if depth < 1:
+      raise ValueError("MLP depth must be at least 1.")
     self.num_steps = num_steps
     self.output_dim = output_dim
-    self.net = nn.Sequential(
-        nn.Linear(code_dim * latent_tokens, hidden_dim),
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(hidden_dim, num_steps * output_dim),
-    )
+    layers: list[nn.Module] = []
+    in_dim = code_dim * latent_tokens
+    for _ in range(depth):
+      layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)])
+      in_dim = hidden_dim
+    layers.append(nn.Linear(hidden_dim, num_steps * output_dim))
+    self.net = nn.Sequential(*layers)
 
   def forward(self, z: torch.Tensor) -> torch.Tensor:
     flat = z.permute(0, 2, 1).contiguous().view(z.shape[0], -1)
@@ -361,15 +363,28 @@ class TrajectoryMLPFSQ(nn.Module):
       code_dim: int,
       mlp_latent_tokens: int,
       mlp_dropout: float,
+      mlp_depth: int,
       fsq_levels: list[int],
       fsq_input_scale: float,
   ):
     super().__init__()
     self.encoder = MLPEncoder(
-        num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens, mlp_dropout
+        num_steps,
+        input_dim,
+        hidden_dim,
+        code_dim,
+        mlp_latent_tokens,
+        mlp_dropout,
+        mlp_depth,
     )
     self.decoder = MLPDecoder(
-        num_steps, input_dim, hidden_dim, code_dim, mlp_latent_tokens, mlp_dropout
+        num_steps,
+        input_dim,
+        hidden_dim,
+        code_dim,
+        mlp_latent_tokens,
+        mlp_dropout,
+        mlp_depth,
     )
     self.quantizer = FiniteScalarQuantizer(fsq_levels, code_dim, fsq_input_scale)
     self.quantizer_bins = self.quantizer.num_bins
@@ -795,12 +810,18 @@ def train(args: argparse.Namespace) -> None:
       code_dim=args.code_dim,
       mlp_latent_tokens=args.mlp_latent_tokens,
       mlp_dropout=args.mlp_dropout,
+      mlp_depth=args.mlp_depth,
       fsq_levels=args.fsq_levels,
       fsq_input_scale=args.fsq_input_scale,
   ).to(device)
   optimizer = torch.optim.AdamW(
       model.parameters(), lr=args.lr, weight_decay=args.weight_decay
   )
+  scheduler = None
+  if args.lr_schedule == "cosine":
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.min_lr
+    )
   saved_plot_paths = []
   pdf_path = None
   if args.plot_every > 0:
@@ -875,6 +896,7 @@ def train(args: argparse.Namespace) -> None:
         "vq": total_vq / batches,
         "perplexity": perplexity,
         "quantize_strength": quantize_strength,
+        "lr": optimizer.param_groups[0]["lr"],
     }
     if len(val_x) > 0:
       val_metrics = evaluate_reconstruction(
@@ -917,7 +939,8 @@ def train(args: argparse.Namespace) -> None:
           f"{val_log} "
           f"vq={epoch_metrics['vq']:.5f} "
           f"last_batch_perplexity={perplexity:.2f} "
-          f"quantize_strength={quantize_strength:.2f}"
+          f"quantize_strength={quantize_strength:.2f} "
+          f"lr={epoch_metrics['lr']:.6g}"
       )
     if (
         args.latent_stats_every > 0
@@ -960,9 +983,11 @@ def train(args: argparse.Namespace) -> None:
                 quantize_strength=quantize_strength,
                 num_plot_samples=args.num_plot_samples,
                 decode_absolute_positions=args.decode_absolute_positions,
-                split_name="val",
-            )
+              split_name="val",
+          )
         )
+    if scheduler is not None:
+      scheduler.step()
 
   if pdf_path is not None and saved_plot_paths:
     save_reconstruction_pdf(saved_plot_paths, pdf_path)
@@ -1162,6 +1187,12 @@ def parse_args() -> argparse.Namespace:
       help="Dropout probability applied after MLP hidden activations.",
   )
   parser.add_argument(
+      "--mlp-depth",
+      type=int,
+      default=2,
+      help="Number of hidden Linear/ReLU blocks in each MLP encoder/decoder.",
+  )
+  parser.add_argument(
       "--fsq-levels",
       type=int,
       nargs="+",
@@ -1233,6 +1264,18 @@ def parse_args() -> argparse.Namespace:
       help="Fraction of extracted trajectories held out for validation metrics.",
   )
   parser.add_argument("--lr", type=float, default=3e-4)
+  parser.add_argument(
+      "--lr-schedule",
+      choices=("constant", "cosine"),
+      default="constant",
+      help="Learning-rate schedule. Constant preserves the fixed-lr baseline.",
+  )
+  parser.add_argument(
+      "--min-lr",
+      type=float,
+      default=0.0,
+      help="Minimum learning rate used by --lr-schedule cosine.",
+  )
   parser.add_argument("--weight-decay", type=float, default=1e-4)
   parser.add_argument(
       "--input-noise-std",
