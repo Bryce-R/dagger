@@ -117,7 +117,7 @@ def xy_metrics(recon_xy: torch.Tensor, target_xy: torch.Tensor) -> dict[str, flo
   second_errors = max_abs_xy_error_by_second(recon_xy, target_xy)
   p99_second_errors = p99_abs_xy_error_by_second(recon_xy, target_xy)
   return {
-      "pos_loss": float(F.smooth_l1_loss(recon_xy, target_xy)),
+      "pos_loss": float(F.mse_loss(recon_xy, target_xy)),
       "xy_mse": float(F.mse_loss(recon_xy, target_xy)),
       "xy_mae": float((recon_xy - target_xy).abs().mean()),
       "max_error_by_second": format_second_errors(second_errors),
@@ -237,7 +237,7 @@ def reconstruct_xy_for_model(
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="Evaluate naive Waymo XY binning.")
   parser.add_argument("--tfrecord", action="append", required=True)
-  parser.add_argument("--num-steps", type=int, default=50)
+  parser.add_argument("--num-steps", type=int, default=10)
   parser.add_argument("--max-trajectories", type=int, default=4096)
   parser.add_argument("--include-all-valid-tracks", action="store_true")
   parser.add_argument("--include-all-states", action="store_true")

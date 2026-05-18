@@ -63,7 +63,8 @@ TRACK_TYPE_NAMES = {
     3: "cyclist",
     4: "other",
 }
-WAYMO_STEPS_PER_SECOND = 10
+WAYMO_STATE_STRIDE = 5
+WAYMO_STEPS_PER_SECOND = 10 // WAYMO_STATE_STRIDE
 
 
 def ensure_waymo_scenario_pb2():
@@ -173,13 +174,13 @@ def extract_waymo_trajectories(
         track_indices = [p.track_index for p in scenario.tracks_to_predict]
 
       start = scenario.current_time_index
-      end = start + num_steps
+      end = start + (num_steps - 1) * WAYMO_STATE_STRIDE + 1
       for track_index in track_indices:
         stats["candidate_tracks"] += 1
         track = scenario.tracks[track_index]
         if track.object_type not in object_types:
           continue
-        states = track.states[start:end]
+        states = track.states[start:end:WAYMO_STATE_STRIDE]
         if len(states) != num_steps or not all(state.valid for state in states):
           continue
 
@@ -557,12 +558,18 @@ def absolute_position_loss(
     mean: torch.Tensor,
     std: torch.Tensor,
     decode_absolute_positions: bool,
+    loss_type: str = "mse",
 ) -> torch.Tensor:
+  """Loss on physical absolute XY positions."""
   mean = mean.to(target.device)
   std = std.to(target.device)
   recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
   target_xy = xy_to_positions(target * std + mean, decode_absolute_positions)
-  return F.smooth_l1_loss(recon_xy, target_xy)
+  if loss_type == "smooth_l1":
+    return F.smooth_l1_loss(recon_xy, target_xy)
+  if loss_type != "mse":
+    raise ValueError(f"Unknown position loss type: {loss_type}")
+  return F.mse_loss(recon_xy, target_xy)
 
 
 def tail_position_loss(
@@ -821,7 +828,12 @@ def train(args: argparse.Namespace) -> None:
       )
       recon_loss = F.smooth_l1_loss(recon, batch_x)
       pos_loss = absolute_position_loss(
-          recon, batch_x, mean, std, args.decode_absolute_positions
+          recon,
+          batch_x,
+          mean,
+          std,
+          args.decode_absolute_positions,
+          args.position_loss_type,
       )
       tail_loss = recon_loss.new_zeros(())
       if args.tail_position_loss_weight > 0.0:
@@ -839,7 +851,7 @@ def train(args: argparse.Namespace) -> None:
             recon, batch_x, mean, std, args.decode_absolute_positions
         )
       loss = (
-          recon_loss
+          args.reconstruction_loss_weight * recon_loss
           + args.position_loss_weight * pos_loss
           + args.tail_position_loss_weight * tail_loss
           + args.final_position_loss_weight * final_loss
@@ -1106,7 +1118,7 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--tfrecord", action="append", required=True)
   parser.add_argument("--epochs", type=int, default=20)
-  parser.add_argument("--num-steps", type=int, default=50)
+  parser.add_argument("--num-steps", type=int, default=10)
   parser.add_argument(
       "--include-yaw",
       action="store_true",
@@ -1178,6 +1190,21 @@ def parse_args() -> argparse.Namespace:
       help="Linearly blend continuous latents into quantized latents.",
   )
   parser.add_argument("--position-loss-weight", type=float, default=0.0)
+  parser.add_argument(
+      "--position-loss-type",
+      choices=("smooth_l1", "mse"),
+      default="mse",
+      help="Physical absolute XY loss used by --position-loss-weight.",
+  )
+  parser.add_argument(
+      "--reconstruction-loss-weight",
+      type=float,
+      default=1.0,
+      help=(
+          "Weight for normalized per-timestep reconstruction loss across all "
+          "channels. Set to 0 for position-only training."
+      ),
+  )
   parser.add_argument(
       "--tail-position-loss-weight",
       type=float,
