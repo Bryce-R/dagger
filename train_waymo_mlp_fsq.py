@@ -565,6 +565,40 @@ def absolute_position_loss(
   return F.smooth_l1_loss(recon_xy, target_xy)
 
 
+def tail_position_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    decode_absolute_positions: bool,
+    tail_fraction: float,
+) -> torch.Tensor:
+  """Smooth L1 on the highest-error trajectories in the batch."""
+  mean = mean.to(target.device)
+  std = std.to(target.device)
+  recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
+  target_xy = xy_to_positions(target * std + mean, decode_absolute_positions)
+  per_example_error = (recon_xy - target_xy).abs().amax(dim=(1, 2))
+  tail_count = max(1, int(math.ceil(per_example_error.numel() * tail_fraction)))
+  tail_indices = torch.topk(per_example_error, k=tail_count).indices
+  return F.smooth_l1_loss(recon_xy[tail_indices], target_xy[tail_indices])
+
+
+def final_position_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    decode_absolute_positions: bool,
+) -> torch.Tensor:
+  """Smooth L1 on the final absolute XY position."""
+  mean = mean.to(target.device)
+  std = std.to(target.device)
+  recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
+  target_xy = xy_to_positions(target * std + mean, decode_absolute_positions)
+  return F.smooth_l1_loss(recon_xy[:, -1], target_xy[:, -1])
+
+
 def evaluate_reconstruction(
     model: nn.Module,
     x: torch.Tensor,
@@ -779,14 +813,38 @@ def train(args: argparse.Namespace) -> None:
     last_indices = None
     for batch_x, _ in loader:
       batch_x = batch_x.to(device)
+      model_x = batch_x
+      if args.input_noise_std > 0.0:
+        model_x = batch_x + torch.randn_like(batch_x) * args.input_noise_std
       recon, vq_loss, indices = model(
-          batch_x, quantize_strength=quantize_strength
+          model_x, quantize_strength=quantize_strength
       )
       recon_loss = F.smooth_l1_loss(recon, batch_x)
       pos_loss = absolute_position_loss(
           recon, batch_x, mean, std, args.decode_absolute_positions
       )
-      loss = recon_loss + args.position_loss_weight * pos_loss + vq_loss
+      tail_loss = recon_loss.new_zeros(())
+      if args.tail_position_loss_weight > 0.0:
+        tail_loss = tail_position_loss(
+            recon,
+            batch_x,
+            mean,
+            std,
+            args.decode_absolute_positions,
+            args.tail_position_fraction,
+        )
+      final_loss = recon_loss.new_zeros(())
+      if args.final_position_loss_weight > 0.0:
+        final_loss = final_position_loss(
+            recon, batch_x, mean, std, args.decode_absolute_positions
+        )
+      loss = (
+          recon_loss
+          + args.position_loss_weight * pos_loss
+          + args.tail_position_loss_weight * tail_loss
+          + args.final_position_loss_weight * final_loss
+          + vq_loss
+      )
       optimizer.zero_grad(set_to_none=True)
       loss.backward()
       optimizer.step()
@@ -1121,6 +1179,27 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--position-loss-weight", type=float, default=0.0)
   parser.add_argument(
+      "--tail-position-loss-weight",
+      type=float,
+      default=0.0,
+      help=(
+          "Weight for Smooth L1 absolute-XY loss on the highest-error "
+          "trajectories in each batch."
+      ),
+  )
+  parser.add_argument(
+      "--tail-position-fraction",
+      type=float,
+      default=0.1,
+      help="Fraction of each batch used by --tail-position-loss-weight.",
+  )
+  parser.add_argument(
+      "--final-position-loss-weight",
+      type=float,
+      default=0.0,
+      help="Weight for Smooth L1 loss on final-step absolute XY.",
+  )
+  parser.add_argument(
       "--val-fraction",
       type=float,
       default=0.2,
@@ -1128,6 +1207,15 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--weight-decay", type=float, default=1e-4)
+  parser.add_argument(
+      "--input-noise-std",
+      type=float,
+      default=0.0,
+      help=(
+          "Stddev of Gaussian noise added to normalized training inputs while "
+          "reconstructing the clean target. Use as denoising regularization."
+      ),
+  )
   parser.add_argument("--log-every", type=int, default=5)
   parser.add_argument(
       "--latent-stats-every",

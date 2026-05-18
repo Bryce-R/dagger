@@ -44,6 +44,29 @@ env PYTHONUNBUFFERED=1 MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/priva
 - Validation metrics exposed heavy overfitting. Full-data metrics from older runs were optimistic.
 - `--position-loss-weight 0` produced better same-data max-error tails than `10`, but validation still overfits.
 - Dropout `0.2` and `0.05` hurt final validation versus no dropout. Dropout `0.05` had the best early val `pos_loss` around epoch 1000.
+- To reduce the validation gap, use `--include-all-valid-tracks`, smaller capacity
+  (`--hidden-dim 128 --code-dim 16 --fsq-levels 64`), light denoising
+  (`--input-noise-std 0.02`), and the best validation checkpoint.
+- Naive direct absolute-XY binning is a strong reconstruction baseline but uses
+  far more bits than compact FSQ. Correct tokenized comparison is one timestep
+  token with joint XY vocab: 50x50 XY bins means 50 tokens and vocab size 2500.
+  Matched FSQ uses `--mlp-latent-tokens 50 --code-dim 2 --fsq-levels 50`,
+  also 50 tokens with joint vocab 2500. On the 4,096 all-valid split, matched
+  FSQ reached val `pos_loss=0.037426` vs 50x50 bins at `0.110475`, but bins
+  had a much tighter max-error tail (`~1.47m` vs FSQ peaking above `14m`).
+- Tail-focused losses improve sparse-case coverage. Matched FSQ plus
+  `--tail-position-loss-weight 0.5 --tail-position-fraction 0.1`
+  `--final-position-loss-weight 0.5` reached val `pos_loss=0.014194` and
+  reduced 5s val max error to `5.52m`. A stronger `1.0/1.0` setting improved
+  the 5s tail slightly to `5.26m` but worsened average val loss to `0.016001`.
+- P99 validation absolute coordinate error is much better than max for tail-loss
+  FSQ. Tail `0.5`/final `0.5` p99 by second is
+  `0.536941 / 0.530983 / 0.685823 / 0.746115 / 0.828350`, better than 50x50
+  bins p99 `1.397281 / 1.332420 / 1.363819 / 1.370701 / 1.408838`. Remaining
+  FSQ issue is a few extreme max-error outliers.
+- No-tail matched FSQ p99 is
+  `0.735312 / 1.010828 / 1.295937 / 1.548877 / 1.620797`: better than bins at
+  1s-3s, worse at 4s-5s. Tail loss is needed for long-horizon p99.
 - More latent tokens helped same-data tails at 2 tokens, but 4 tokens regressed some horizons.
 - Absolute-position decoding did not beat delta decoding.
 

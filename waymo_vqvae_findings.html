@@ -86,6 +86,8 @@
     <li>Validation metrics show the MLP/FSQ runs overfit heavily. Same-data max-error results were optimistic before the train/val split.</li>
     <li>For dynamic-state MLP runs, <code>--position-loss-weight 0</code> produced better same-data max-error tails than <code>10</code>, but validation still diverged.</li>
     <li>Dropout regularization did not fix validation. Dropout <code>0.05</code> helped early validation at epoch 1000, but final validation degraded; dropout <code>0.2</code> underfit and was worse.</li>
+    <li>The best validation-gap fix so far is not more epochs: use <code>--include-all-valid-tracks</code>, reduce capacity to roughly <code>hidden=128, code_dim=16, fsq=64</code>, and select the best validation checkpoint.</li>
+    <li>Light denoising input noise helped slightly. <code>--input-noise-std 0.02</code> gave the best validation loss among the new regularized runs; <code>0.05</code> was more stable at the final epoch but had a worse best checkpoint.</li>
   </ul>
 
   <h2>Validation And Regularization</h2>
@@ -117,6 +119,257 @@
       </tr>
     </tbody>
   </table>
+
+  <h2>Validation Gap Experiments, 2026-05-17</h2>
+  <p>
+    Goal: make validation position loss approach training position loss in the
+    dedicated FSQ setup. All runs used <code>train_waymo_mlp_fsq.py</code>,
+    MPS, dynamic states, <code>--position-loss-weight 0</code>, validation
+    fraction <code>0.2</code>, and best-validation checkpoint saving.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Run</th>
+        <th>Data</th>
+        <th>Best epoch</th>
+        <th>Best train pos</th>
+        <th>Best val pos</th>
+        <th>Final train / val pos</th>
+        <th>Outcome</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Hidden 256, code 32, FSQ 128</td>
+        <td>4,096 all-valid vehicle tracks</td>
+        <td>247</td>
+        <td>0.0144</td>
+        <td class="ok">0.0264</td>
+        <td>0.0135 / 0.0896</td>
+        <td>Data expansion fixed most of the old gap early, but continued training still overfit.</td>
+      </tr>
+      <tr>
+        <td>Hidden 128, code 16, FSQ 64</td>
+        <td>4,096 all-valid vehicle tracks</td>
+        <td>278</td>
+        <td>0.0250</td>
+        <td class="ok">0.0349</td>
+        <td>0.0222 / 0.0624</td>
+        <td>Best train/val closeness among clean runs. Smaller capacity helps.</td>
+      </tr>
+      <tr>
+        <td>Hidden 128, code 16, FSQ 64</td>
+        <td>8,192 all-valid vehicle tracks</td>
+        <td>170</td>
+        <td>0.0229</td>
+        <td>0.0385</td>
+        <td>0.0208 / 0.0572</td>
+        <td>More tracks did not improve this one-shard validation split; max-error tail worsened.</td>
+      </tr>
+      <tr>
+        <td>Hidden 64, code 8, FSQ 32</td>
+        <td>4,096 all-valid vehicle tracks</td>
+        <td>540</td>
+        <td>0.0519</td>
+        <td>0.0611</td>
+        <td>0.0484 / 0.0840</td>
+        <td>Gap is small only because the model underfits. Not a useful direction.</td>
+      </tr>
+      <tr>
+        <td>Hidden 128, code 16, FSQ 64, input noise 0.02</td>
+        <td>4,096 all-valid vehicle tracks</td>
+        <td>568</td>
+        <td>0.0184</td>
+        <td class="ok">0.0317</td>
+        <td>0.0229 / 0.0724</td>
+        <td>Best regularized validation loss. Keep as the current candidate, with early stopping.</td>
+      </tr>
+      <tr>
+        <td>Hidden 128, code 16, FSQ 64, input noise 0.05</td>
+        <td>4,096 all-valid vehicle tracks</td>
+        <td>665</td>
+        <td>0.0203</td>
+        <td>0.0376</td>
+        <td class="ok">0.0213 / 0.0472</td>
+        <td>Best final-epoch gap and final max-error tail, but worse best checkpoint than noise 0.02.</td>
+      </tr>
+      <tr>
+        <td>Hidden 128, code 16, FSQ 64, input noise 0.02, lr 1e-4</td>
+        <td>4,096 all-valid vehicle tracks</td>
+        <td>830</td>
+        <td>0.0209</td>
+        <td>0.0386</td>
+        <td>0.0260 / 0.0456</td>
+        <td>Lower LR slows the overfit but does not beat the default LR best checkpoint.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Interpretation: the original validation gap was mainly a data-size and
+    capacity issue. The target-track-only dataset was too small for the MLP.
+    The best current recipe is all-valid vehicle tracks, moderate capacity
+    (<code>hidden=128, code_dim=16, fsq=64</code>), light denoising noise
+    (<code>0.02</code>), and selecting the best validation checkpoint. Training
+    longer past the best epoch reliably lowers train loss while raising val loss.
+  </p>
+
+  <h2>Naive XY Binning Baseline, 2026-05-17</h2>
+  <p>
+    This baseline has no learned network. It fits uniform bins on train-set
+    absolute local XY positions and reconstructs the bin centers. It uses the
+    same 4,096 all-valid vehicle trajectories and seeded 80/20 split as the
+    FSQ validation-gap runs. This tests whether the FSQ model is mainly losing
+    accuracy because it must reconstruct XY through a compact learned latent.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Train pos_loss</th>
+        <th>Val pos_loss</th>
+        <th>Val max error 1s / 2s / 3s / 4s / 5s</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Global XY bins, 50 bins/axis</td>
+        <td>0.113239</td>
+        <td>0.110475</td>
+        <td>1.462981 / 1.466774 / 1.466465 / 1.467387 / 1.466957</td>
+        <td>Correct tokenized baseline: 50 timestep tokens, each with joint XY vocab <code>50 * 50 = 2500</code>.</td>
+      </tr>
+      <tr>
+        <td>Global XY bins, 64 bins/axis</td>
+        <td>0.156399</td>
+        <td>0.157084</td>
+        <td>1.144575 / 1.143652 / 1.141987 / 1.145939 / 1.147007</td>
+        <td>Train and val match, but average error is too high.</td>
+      </tr>
+      <tr>
+        <td>Global XY bins, 128 bins/axis</td>
+        <td>0.034799</td>
+        <td>0.034757</td>
+        <td>0.570930 / 0.570007 / 0.573620 / 0.573115 / 0.573360</td>
+        <td>About the same val pos_loss as the best compact FSQ checkpoint, with much lower max error.</td>
+      </tr>
+      <tr>
+        <td>Global XY bins, 256 bins/axis</td>
+        <td class="ok">0.005054</td>
+        <td class="ok">0.004925</td>
+        <td>0.284724 / 0.284961 / 0.286798 / 0.286294 / 0.286533</td>
+        <td>Strong simple baseline. It beats current FSQ val loss, but stores every timestep XY directly.</td>
+      </tr>
+      <tr>
+        <td>Global XY bins, 512 bins/axis</td>
+        <td class="ok">0.003599</td>
+        <td class="ok">0.003633</td>
+        <td>0.142935 / 0.143050 / 0.143387 / 0.142882 / 0.143124</td>
+        <td>More bins reduce max error further; still not a compact learned trajectory representation.</td>
+      </tr>
+      <tr>
+        <td>Per-timestep XY bins, 256 bins/axis</td>
+        <td class="ok">0.002348</td>
+        <td class="ok">0.002544</td>
+        <td>0.624830 / 1.232666 / 1.218287 / 0.225735 / 0.286533</td>
+        <td>Best average loss, but worse early max-error tail from validation values outside per-step train ranges.</td>
+      </tr>
+      <tr>
+        <td>MLP-FSQ best checkpoint, hidden 128, code 16, FSQ 64, noise 0.02</td>
+        <td>0.018480</td>
+        <td>0.031688</td>
+        <td>1.238398 / 2.770185 / 4.986741 / 6.631495 / 8.309866</td>
+        <td>Much more compact: one 16-channel FSQ token. Current decoder creates the long-horizon max-error tail.</td>
+      </tr>
+      <tr>
+        <td>MLP-FSQ matched tokens, 50 tokens, joint vocab 2500, noise 0.02</td>
+        <td>0.017568</td>
+        <td class="ok">0.037426</td>
+        <td>5.145096 / 9.629272 / 12.908590 / 14.049379 / 13.162736</td>
+        <td>Correct match to 50x50 XY binning: <code>50</code> latent tokens, <code>code_dim=2</code>, <code>fsq_levels=50</code>, so each token has <code>50 * 50 = 2500</code> joint values.</td>
+      </tr>
+      <tr>
+        <td>Matched FSQ + top-10% tail loss 0.5 + final loss 0.5</td>
+        <td class="ok">0.006024</td>
+        <td class="ok">0.014194</td>
+        <td>1.906581 / 3.294484 / 4.017531 / 4.960294 / 5.520833</td>
+        <td>Best average validation loss so far. Tail loss improves sparse cases and avoids the severe overfit seen in the no-tail run.</td>
+      </tr>
+      <tr>
+        <td>Matched FSQ + top-10% tail loss 1.0 + final loss 1.0</td>
+        <td class="ok">0.006351</td>
+        <td class="ok">0.016001</td>
+        <td>2.319546 / 3.887117 / 3.857877 / 4.569462 / 5.257017</td>
+        <td>Slightly worse average loss than 0.5/0.5, but better 4s-5s tail.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Corrected takeaway: compare tokens as one token per timestep with joint XY
+    vocabulary. The fair 50-token, 2500-vocab comparison is global 50x50 XY bins
+    versus FSQ with <code>--mlp-latent-tokens 50 --code-dim 2 --fsq-levels 50</code>.
+    In that setup FSQ wins average validation loss (<code>0.037426</code> vs
+    <code>0.110475</code>), but the naive bins have a much tighter max-error bound
+    (about <code>1.47m</code> at every second, versus FSQ peaking above
+    <code>14m</code>). Adding a top-10% tail loss and final-step loss makes FSQ
+    much better for sparse examples: val loss drops to <code>0.014194</code> and
+    the 5s max error drops to <code>5.52m</code>. Direct bins still have the
+    tighter hard max-error bound. Direct bins with larger vocab, e.g. 256x256
+    per timestep, are a different budget and remain much stronger on both
+    average and tail absolute XY error.
+  </p>
+
+  <h2>P99 Validation Error By Second</h2>
+  <p>
+    P99 is computed over absolute coordinate error at each horizon on the
+    validation split. It is less sensitive than max error to one-off outliers,
+    but still captures sparse-case behavior better than average Smooth L1.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Val pos_loss</th>
+        <th>Val P99 abs coord error 1s / 2s / 3s / 4s / 5s</th>
+        <th>Val max abs coord error 1s / 2s / 3s / 4s / 5s</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Naive 50x50 XY bins</td>
+        <td>0.110475</td>
+        <td>1.397281 / 1.332420 / 1.363819 / 1.370701 / 1.408838</td>
+        <td>1.462981 / 1.466774 / 1.466465 / 1.467387 / 1.466957</td>
+      </tr>
+      <tr>
+        <td>Matched FSQ, no tail loss</td>
+        <td>0.037426</td>
+        <td>0.735312 / 1.010828 / 1.295937 / 1.548877 / 1.620797</td>
+        <td>5.145096 / 9.629272 / 12.908590 / 14.049379 / 13.162736</td>
+      </tr>
+      <tr>
+        <td>Matched FSQ + tail 0.5 + final 0.5</td>
+        <td class="ok">0.014194</td>
+        <td class="ok">0.536941 / 0.530983 / 0.685823 / 0.746115 / 0.828350</td>
+        <td>1.906581 / 3.294484 / 4.017531 / 4.960294 / 5.520833</td>
+      </tr>
+      <tr>
+        <td>Matched FSQ + tail 1.0 + final 1.0</td>
+        <td class="ok">0.016001</td>
+        <td class="ok">0.605458 / 0.570413 / 0.724678 / 0.799243 / 0.835734</td>
+        <td>2.319546 / 3.887117 / 3.857877 / 4.569462 / 5.257017</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    P99 changes the conclusion: matched FSQ without tail loss already beats the
+    50x50 bin baseline at 1s-3s, but loses at 4s-5s. Tail loss is what brings FSQ
+    below the bin baseline for the 99th percentile at every horizon. The bin
+    baseline still wins max error because its per-step quantization has a hard
+    bound. That means FSQ is now covering almost all validation cases well; the
+    remaining issue is the last few outlier trajectories.
+  </p>
 
   <h2>MLP Architecture Comparison</h2>
   <table>
@@ -180,6 +433,28 @@
   --include-all-states \
   --val-fraction 0.2 \
   --plot-dir waymo_mlp_fsq_dynamicstates_h512_cd64_tok1_posw0_e12000_b512</code></pre>
+  <p>Current best validation-gap candidate:</p>
+  <pre><code>env PYTHONUNBUFFERED=1 MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/private/tmp python train_waymo_mlp_fsq.py \
+  --tfrecord /Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000 \
+  --hidden-dim 128 \
+  --code-dim 16 \
+  --mlp-latent-tokens 1 \
+  --fsq-levels 64 \
+  --fsq-input-scale 0.1 \
+  --position-loss-weight 0 \
+  --input-noise-std 0.02 \
+  --plot-every 500 \
+  --num-plot-samples 5 \
+  --log-every 250 \
+  --latent-stats-every 500 \
+  --device mps \
+  --epochs 1500 \
+  --batch-size 512 \
+  --include-all-states \
+  --include-all-valid-tracks \
+  --max-trajectories 4096 \
+  --val-fraction 0.2 \
+  --plot-dir waymo_valgap_mlp_fsq_datamore_h128_cd16_fsq64_noise002_e1500_b512</code></pre>
   <p>Long MLP FSQ MPS run with 10-example reconstruction plots:</p>
   <pre><code>env PYTHONUNBUFFERED=1 MPLCONFIGDIR=/private/tmp/mplconfig XDG_CACHE_HOME=/private/tmp python train_waymo_trajectory_vqvae.py \
   --tfrecord /Users/pengkai/Code/waymo-open-dataset/uncompressed_scenario_training_training.tfrecord-00000-of-01000 \
