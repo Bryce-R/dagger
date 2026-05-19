@@ -606,6 +606,29 @@ def tail_position_loss(
   return F.smooth_l1_loss(recon_xy[tail_indices], target_xy[tail_indices])
 
 
+def early_tail_position_loss(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    decode_absolute_positions: bool,
+    tail_fraction: float,
+    horizon_steps: int,
+) -> torch.Tensor:
+  """Smooth L1 on the highest-error trajectories within the early horizon."""
+  mean = mean.to(target.device)
+  std = std.to(target.device)
+  recon_xy = xy_to_positions(recon * std + mean, decode_absolute_positions)
+  target_xy = xy_to_positions(target * std + mean, decode_absolute_positions)
+  horizon_steps = max(1, min(horizon_steps, recon_xy.shape[1]))
+  recon_early = recon_xy[:, :horizon_steps]
+  target_early = target_xy[:, :horizon_steps]
+  per_example_error = (recon_early - target_early).abs().amax(dim=(1, 2))
+  tail_count = max(1, int(math.ceil(per_example_error.numel() * tail_fraction)))
+  tail_indices = torch.topk(per_example_error, k=tail_count).indices
+  return F.smooth_l1_loss(recon_early[tail_indices], target_early[tail_indices])
+
+
 def final_position_loss(
     recon: torch.Tensor,
     target: torch.Tensor,
@@ -866,6 +889,17 @@ def train(args: argparse.Namespace) -> None:
             args.decode_absolute_positions,
             args.tail_position_fraction,
         )
+      early_tail_loss = recon_loss.new_zeros(())
+      if args.early_tail_position_loss_weight > 0.0:
+        early_tail_loss = early_tail_position_loss(
+            recon,
+            batch_x,
+            mean,
+            std,
+            args.decode_absolute_positions,
+            args.early_tail_position_fraction,
+            args.early_tail_position_steps,
+        )
       final_loss = recon_loss.new_zeros(())
       if args.final_position_loss_weight > 0.0:
         final_loss = final_position_loss(
@@ -875,6 +909,7 @@ def train(args: argparse.Namespace) -> None:
           args.reconstruction_loss_weight * recon_loss
           + args.position_loss_weight * pos_loss
           + args.tail_position_loss_weight * tail_loss
+          + args.early_tail_position_loss_weight * early_tail_loss
           + args.final_position_loss_weight * final_loss
           + vq_loss
       )
@@ -1250,6 +1285,24 @@ def parse_args() -> argparse.Namespace:
       type=float,
       default=0.1,
       help="Fraction of each batch used by --tail-position-loss-weight.",
+  )
+  parser.add_argument(
+      "--early-tail-position-loss-weight",
+      type=float,
+      default=0.0,
+      help="Weight for Smooth L1 absolute-XY loss on early-horizon tail examples.",
+  )
+  parser.add_argument(
+      "--early-tail-position-fraction",
+      type=float,
+      default=0.05,
+      help="Fraction of each batch used by --early-tail-position-loss-weight.",
+  )
+  parser.add_argument(
+      "--early-tail-position-steps",
+      type=int,
+      default=6,
+      help="Number of initial timesteps used by early-tail position loss.",
   )
   parser.add_argument(
       "--final-position-loss-weight",

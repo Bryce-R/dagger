@@ -303,6 +303,20 @@
         <td>2.319546 / 3.887117 / 3.857877 / 4.569462 / 5.257017</td>
         <td>Slightly worse average loss than 0.5/0.5, but better 4s-5s tail.</td>
       </tr>
+      <tr>
+        <td>Abs-XY-only FSQ, no normalized reconstruction loss</td>
+        <td class="ok">0.003730</td>
+        <td class="ok">0.012602</td>
+        <td>5.811291 / 5.360386 / 1.747272 / 3.071284 / 8.965078</td>
+        <td>Uses <code>--decode-absolute-positions --reconstruction-loss-weight 0 --position-loss-weight 1</code>. It removes per-step delta reconstruction pressure and optimizes decoded absolute XY only.</td>
+      </tr>
+      <tr>
+        <td>Abs-XY-only FSQ + top-10% tail 0.5 + final 0.5</td>
+        <td class="ok">0.003401</td>
+        <td class="ok">0.011651</td>
+        <td>4.038042 / 5.105073 / 2.690067 / 3.707683 / 5.481085</td>
+        <td>Best average validation loss so far. Still has max outliers, but P99 is strong.</td>
+      </tr>
     </tbody>
   </table>
   <p>
@@ -318,6 +332,10 @@
     tighter hard max-error bound. Direct bins with larger vocab, e.g. 256x256
     per timestep, are a different budget and remain much stronger on both
     average and tail absolute XY error.
+    Training with absolute XY as the only reconstruction objective works even
+    better on average: <code>--decode-absolute-positions --reconstruction-loss-weight 0
+    --position-loss-weight 1</code> reaches val <code>pos_loss=0.012602</code>,
+    and adding tail/final absolute-position terms reaches <code>0.011651</code>.
   </p>
 
   <h2>P99 Validation Error By Second</h2>
@@ -360,6 +378,18 @@
         <td class="ok">0.605458 / 0.570413 / 0.724678 / 0.799243 / 0.835734</td>
         <td>2.319546 / 3.887117 / 3.857877 / 4.569462 / 5.257017</td>
       </tr>
+      <tr>
+        <td>Abs-XY-only FSQ</td>
+        <td class="ok">0.012602</td>
+        <td class="ok">0.415871 / 0.524758 / 0.596356 / 0.772238 / 1.097438</td>
+        <td>5.811291 / 5.360386 / 1.747272 / 3.071284 / 8.965078</td>
+      </tr>
+      <tr>
+        <td>Abs-XY-only FSQ + tail 0.5 + final 0.5</td>
+        <td class="ok">0.011651</td>
+        <td class="ok">0.493376 / 0.436652 / 0.549101 / 0.708736 / 0.786554</td>
+        <td>4.038042 / 5.105073 / 2.690067 / 3.707683 / 5.481085</td>
+      </tr>
     </tbody>
   </table>
   <p>
@@ -369,6 +399,85 @@
     baseline still wins max error because its per-step quantization has a hard
     bound. That means FSQ is now covering almost all validation cases well; the
     remaining issue is the last few outlier trajectories.
+  </p>
+
+  <h2>Variable-Length Segment and Residual Tokenizers, 2026-05-18</h2>
+  <p>
+    Fixed timestep tokens are a poor compression target for simple trajectories:
+    cruising for 5 seconds should need one semantic token, while brake-then-accelerate
+    may need two. The new DP experiment searches for the fewest piecewise motion
+    segments that reconstruct the 2Hz trajectory under a rate-distortion objective.
+    Degree 1 means constant velocity; degree 2 means constant acceleration.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Avg tokens</th>
+        <th>Val XY MSE</th>
+        <th>Max P99 under 3s</th>
+        <th>Val P99 1s / 2s / 3s / 4s / 5s</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>2Hz fixed FSQ, Smooth L1 position-only</td>
+        <td>10 fixed</td>
+        <td>0.032849</td>
+        <td>0.657238</td>
+        <td>0.392455 / 0.535571 / 0.657238 / 0.775545 / 1.097036</td>
+        <td>Current fixed-token baseline. It uses every timestep as capacity and still misses early-horizon p99.</td>
+      </tr>
+      <tr>
+        <td>DP oracle, degree 2 threshold 0.2m</td>
+        <td class="ok">1.17</td>
+        <td class="ok">0.001554</td>
+        <td class="ok">0.169719</td>
+        <td class="ok">0.153420 / 0.164980 / 0.155589 / 0.175211 / 0.171093</td>
+        <td>Fewest piecewise constant-acceleration segments under a 0.2m max-error constraint. Median uses one token; p90 uses two.</td>
+      </tr>
+      <tr>
+        <td>DP oracle, degree 2 penalty 0.1</td>
+        <td class="ok">1.21</td>
+        <td class="ok">0.000478</td>
+        <td class="ok">0.119351</td>
+        <td class="ok">0.084939 / 0.100599 / 0.073984 / 0.104120 / 0.113987</td>
+        <td>Rate-distortion form: segment SSE plus token penalty. Best average error and p99 so far.</td>
+      </tr>
+      <tr>
+        <td>Learned boundary MLP, degree 2 teacher</td>
+        <td class="ok">1.68</td>
+        <td class="ok">0.001240</td>
+        <td class="ok">0.171023</td>
+        <td class="ok">0.148060 / 0.171023 / 0.164086 / 0.191575 / 0.190327</td>
+        <td>Imitates DP boundaries from the degree-2 threshold 0.2m oracle. Uses more tokens than DP but meets the &lt;0.2m early p99 goal.</td>
+      </tr>
+      <tr>
+        <td>Residual FSQ, 4 tokens</td>
+        <td>4 fixed</td>
+        <td class="ok">0.003989</td>
+        <td>0.236128</td>
+        <td>0.201246 / 0.206691 / 0.170711 / 0.213425 / 0.231398</td>
+        <td>Iterative full-sequence residual corrections. Much better than fixed FSQ, but less compressed than DP segmentation.</td>
+      </tr>
+      <tr>
+        <td>Residual FSQ, 7 tokens</td>
+        <td>7 fixed</td>
+        <td class="ok">0.004073</td>
+        <td class="ok">0.199725</td>
+        <td>0.169205 / 0.199725 / 0.182295 / 0.189298 / 0.266427</td>
+        <td>Reaches the 3s p99 target but needs many more tokens. The strict 0.01m max-error stop threshold had 0% validation success within 8 tokens.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Main takeaway: variable-length piecewise tokens are the strongest direction.
+    The hand-fit DP oracle proves that most 2Hz vehicle futures are simple enough
+    for roughly one constant-acceleration segment. A learned boundary model already
+    preserves the early-horizon p99 target, but it is not yet as token-efficient
+    as DP. Residual FSQ is useful as a learned correction baseline, but it behaves
+    like iterative refinement rather than semantic compression.
   </p>
 
   <h2>MLP Architecture Comparison</h2>
