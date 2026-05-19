@@ -34,24 +34,45 @@ def physical_xy_positions(
   return xy_to_positions(x * std + mean, decode_absolute_positions=True)
 
 
+def select_target_features(x: torch.Tensor, target_space: str) -> torch.Tensor:
+  if target_space == "xy":
+    return x[..., :2]
+  if target_space == "xy_yaw_velocity":
+    if x.shape[-1] < 6:
+      raise ValueError("--target-space xy_yaw_velocity requires --include-all-states.")
+    return x[..., [0, 1, 2, 4, 5]]
+  raise ValueError(f"unknown target space: {target_space}")
+
+
+def target_features_to_xy(
+    target: torch.Tensor,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+) -> torch.Tensor:
+  physical = target * feature_std.view(1, 1, -1) + feature_mean.view(1, 1, -1)
+  return physical[..., :2]
+
+
 class ResidualFSQTokenizer(nn.Module):
   """Recurrent residual autoencoder with one FSQ token per correction step."""
 
   def __init__(
       self,
       num_steps: int,
+      target_dim: int,
       hidden_dim: int,
       code_dim: int,
       fsq_levels: list[int],
       fsq_input_scale: float,
-      xy_mean: torch.Tensor,
-      xy_std: torch.Tensor,
+      feature_mean: torch.Tensor,
+      feature_std: torch.Tensor,
   ):
     super().__init__()
     self.num_steps = num_steps
-    self.register_buffer("xy_mean", xy_mean.view(1, 1, 2))
-    self.register_buffer("xy_std", xy_std.view(1, 1, 2).clamp_min(1e-6))
-    input_dim = num_steps * 6
+    self.target_dim = target_dim
+    self.register_buffer("feature_mean", feature_mean.view(1, 1, target_dim))
+    self.register_buffer("feature_std", feature_std.view(1, 1, target_dim).clamp_min(1e-6))
+    input_dim = num_steps * target_dim * 3
     self.encoder = nn.Sequential(
         nn.Linear(input_dim, hidden_dim),
         nn.ReLU(),
@@ -64,25 +85,25 @@ class ResidualFSQTokenizer(nn.Module):
         nn.ReLU(),
         nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
-        nn.Linear(hidden_dim, num_steps * 2),
+        nn.Linear(hidden_dim, num_steps * target_dim),
     )
     self.quantizer = FiniteScalarQuantizer(fsq_levels, code_dim, fsq_input_scale)
 
-  def normalize_xy(self, xy: torch.Tensor) -> torch.Tensor:
-    return (xy - self.xy_mean) / self.xy_std
+  def normalize_features(self, features: torch.Tensor) -> torch.Tensor:
+    return (features - self.feature_mean) / self.feature_std
 
   def correction_from_token(
       self,
-      target_xy: torch.Tensor,
-      recon_xy: torch.Tensor,
+      target: torch.Tensor,
+      recon: torch.Tensor,
       quantize_strength: float,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    residual_xy = target_xy - recon_xy
+    residual = target - recon
     features = torch.cat(
         [
-            self.normalize_xy(target_xy),
-            self.normalize_xy(recon_xy),
-            residual_xy / self.xy_std,
+            self.normalize_features(target),
+            self.normalize_features(recon),
+            residual / self.feature_std,
         ],
         dim=-1,
     )
@@ -90,27 +111,27 @@ class ResidualFSQTokenizer(nn.Module):
     latent = latent.unsqueeze(-1)
     quantized, vq_loss, indices = self.quantizer(latent, quantize_strength)
     correction_norm = self.decoder(quantized.squeeze(-1)).view(
-        target_xy.shape[0], self.num_steps, 2
+        target.shape[0], self.num_steps, self.target_dim
     )
-    correction_xy = correction_norm * self.xy_std
-    return correction_xy, vq_loss, indices.squeeze(1)
+    correction = correction_norm * self.feature_std
+    return correction, vq_loss, indices.squeeze(1)
 
   def forward(
       self,
-      target_xy: torch.Tensor,
+      target: torch.Tensor,
       max_tokens: int,
       quantize_strength: float = 1.0,
   ) -> tuple[list[torch.Tensor], torch.Tensor, list[torch.Tensor]]:
-    recon_xy = torch.zeros_like(target_xy)
+    recon = torch.zeros_like(target)
     reconstructions = []
     index_history = []
-    total_vq = target_xy.sum() * 0.0
+    total_vq = target.sum() * 0.0
     for _ in range(max_tokens):
       correction_xy, vq_loss, indices = self.correction_from_token(
-          target_xy, recon_xy, quantize_strength
+          target, recon, quantize_strength
       )
-      recon_xy = recon_xy + correction_xy
-      reconstructions.append(recon_xy)
+      recon = recon + correction_xy
+      reconstructions.append(recon)
       index_history.append(indices)
       total_vq = total_vq + vq_loss
     return reconstructions, total_vq, index_history
@@ -173,6 +194,21 @@ def stop_token_counts(
   return counts
 
 
+def stop_token_counts_by_xy(
+    reconstructions: list[torch.Tensor],
+    target_xy: torch.Tensor,
+    threshold: float,
+    horizon_steps: int | None,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+) -> torch.Tensor:
+  recon_xy = [
+      target_features_to_xy(recon, feature_mean.to(recon.device), feature_std.to(recon.device))
+      for recon in reconstructions
+  ]
+  return stop_token_counts(recon_xy, target_xy, threshold, horizon_steps)
+
+
 def p99_errors_by_second(
     recon_xy: torch.Tensor,
     target_xy: torch.Tensor,
@@ -206,7 +242,10 @@ def format_second_errors(errors: dict[int, float]) -> str:
 
 def evaluate_model(
     model: ResidualFSQTokenizer,
-    xy: torch.Tensor,
+    target: torch.Tensor,
+    target_xy: torch.Tensor,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
     max_tokens: int,
     batch_size: int,
     threshold: float,
@@ -218,14 +257,29 @@ def evaluate_model(
   token_count_parts = []
   model.eval()
   with torch.no_grad():
-    for (batch_xy,) in DataLoader(TensorDataset(xy), batch_size=batch_size):
-      batch_xy = batch_xy.to(device)
-      recons, _, _ = model(batch_xy, max_tokens=max_tokens)
-      counts = stop_token_counts(recons, batch_xy, threshold, stop_horizon_steps)
+    loader = DataLoader(TensorDataset(target, target_xy), batch_size=batch_size)
+    for batch_target, batch_target_xy in loader:
+      batch_target = batch_target.to(device)
+      batch_target_xy = batch_target_xy.to(device)
+      recons, _, _ = model(batch_target, max_tokens=max_tokens)
+      counts = stop_token_counts_by_xy(
+          recons,
+          batch_target_xy,
+          threshold,
+          stop_horizon_steps,
+          feature_mean,
+          feature_std,
+      )
       token_count_parts.append(counts.cpu())
       for token_index, recon in enumerate(recons):
-        recon_parts[token_index].append(recon.cpu())
-  target_xy = xy.cpu()
+        recon_parts[token_index].append(
+            target_features_to_xy(
+                recon.cpu(),
+                feature_mean.cpu(),
+                feature_std.cpu(),
+            )
+        )
+  target_xy = target_xy.cpu()
   token_counts = torch.cat(token_count_parts)
   for token_index in range(max_tokens):
     recon_xy = torch.cat(recon_parts[token_index])
@@ -259,6 +313,140 @@ def evaluate_model(
   return rows
 
 
+def select_stopped_reconstructions(
+    reconstructions: list[torch.Tensor],
+    token_counts: torch.Tensor,
+) -> torch.Tensor:
+  stopped = torch.empty_like(reconstructions[-1])
+  for token_index, recon in enumerate(reconstructions, start=1):
+    mask = token_counts == token_index
+    if mask.any():
+      stopped[mask] = recon[mask]
+  return stopped
+
+
+def plot_reconstructions(
+    target_xy: torch.Tensor,
+    recon_xy: torch.Tensor,
+    token_counts: torch.Tensor,
+    output_path: Path,
+    title: str,
+    sample_indices: list[int],
+) -> None:
+  import matplotlib
+
+  matplotlib.use("Agg")
+  import matplotlib.pyplot as plt
+
+  if not sample_indices:
+    return
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  num_cols = min(3, len(sample_indices))
+  num_rows = math.ceil(len(sample_indices) / num_cols)
+  fig, axes = plt.subplots(
+      num_rows,
+      num_cols,
+      figsize=(5.6 * num_cols, 5.2 * num_rows),
+      squeeze=False,
+  )
+  for axis, sample_index in zip(axes.ravel(), sample_indices):
+    target = target_xy[sample_index]
+    recon = recon_xy[sample_index]
+    axis.plot(target[:, 0], target[:, 1], "o-", color="tab:blue", label="target")
+    axis.plot(recon[:, 0], recon[:, 1], "x--", color="tab:orange", label="residual FSQ")
+    max_error = float((target - recon).abs().max())
+    mse = float(F.mse_loss(recon, target))
+    axis.set_title(
+        f"sample={sample_index} tokens={int(token_counts[sample_index])} "
+        f"max={max_error:.4f}m mse={mse:.6f}"
+    )
+    axis.set_aspect("equal", adjustable="datalim")
+    axis.grid(True, alpha=0.3)
+  for axis in axes.ravel()[len(sample_indices):]:
+    axis.axis("off")
+  handles, labels = axes.ravel()[0].get_legend_handles_labels()
+  fig.legend(handles, labels, loc="lower center", ncol=2)
+  fig.suptitle(title, y=0.98)
+  fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+  fig.savefig(output_path, dpi=180)
+  plt.close(fig)
+
+
+def save_reconstruction_plots(
+    model: ResidualFSQTokenizer,
+    target: torch.Tensor,
+    target_xy: torch.Tensor,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+    max_tokens: int,
+    threshold: float,
+    stop_horizon_steps: int | None,
+    batch_size: int,
+    device: torch.device,
+    output_dir: Path,
+    num_samples: int,
+    split_name: str,
+    epoch: int | None = None,
+) -> list[Path]:
+  recon_parts = [[] for _ in range(max_tokens)]
+  token_count_parts = []
+  model.eval()
+  with torch.no_grad():
+    for batch_target, batch_xy in DataLoader(
+        TensorDataset(target, target_xy), batch_size=batch_size
+    ):
+      batch_target = batch_target.to(device)
+      batch_xy = batch_xy.to(device)
+      recons, _, _ = model(batch_target, max_tokens=max_tokens)
+      token_count_parts.append(
+          stop_token_counts_by_xy(
+              recons,
+              batch_xy,
+              threshold,
+              stop_horizon_steps,
+              feature_mean,
+              feature_std,
+          ).cpu()
+      )
+      for token_index, recon in enumerate(recons):
+        recon_parts[token_index].append(
+            target_features_to_xy(recon.cpu(), feature_mean.cpu(), feature_std.cpu())
+        )
+
+  reconstructions = [torch.cat(parts) for parts in recon_parts]
+  token_counts = torch.cat(token_count_parts)
+  stopped_recon = select_stopped_reconstructions(reconstructions, token_counts)
+  output_dir.mkdir(parents=True, exist_ok=True)
+
+  file_epoch = f"_epoch_{epoch:04d}" if epoch is not None else ""
+  first_indices = list(range(min(num_samples, len(target_xy))))
+  first_path = output_dir / f"reconstruction_{split_name}{file_epoch}_first_samples.png"
+  plot_reconstructions(
+      target_xy,
+      stopped_recon,
+      token_counts,
+      first_path,
+      f"Residual FSQ {split_name} stopped reconstruction, threshold={threshold:g}m",
+      first_indices,
+  )
+
+  per_example_error = (stopped_recon - target_xy).abs().amax(dim=(1, 2))
+  worst_indices = torch.topk(
+      per_example_error,
+      k=min(num_samples, len(target_xy)),
+  ).indices.tolist()
+  worst_path = output_dir / f"reconstruction_{split_name}{file_epoch}_worst_samples.png"
+  plot_reconstructions(
+      target_xy,
+      stopped_recon,
+      token_counts,
+      worst_path,
+      f"Residual FSQ {split_name} worst stopped reconstructions, threshold={threshold:g}m",
+      worst_indices,
+  )
+  return [first_path, worst_path]
+
+
 def write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
   fieldnames = []
@@ -289,6 +477,12 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--fsq-levels", type=int, nargs="+", default=[64])
   parser.add_argument("--fsq-input-scale", type=float, default=0.1)
   parser.add_argument("--max-tokens", type=int, default=4)
+  parser.add_argument(
+      "--target-space",
+      choices=("xy", "xy_yaw_velocity"),
+      default="xy",
+      help="Feature space reconstructed by residual tokens.",
+  )
   parser.add_argument("--loss-type", choices=("smooth_l1", "mse"), default="smooth_l1")
   parser.add_argument("--final-loss-weight", type=float, default=1.0)
   parser.add_argument("--lr", type=float, default=3e-4)
@@ -305,6 +499,14 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--log-every", type=int, default=100)
   parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
   parser.add_argument("--output-dir", default="waymo_residual_fsq")
+  parser.add_argument("--plot-dir", default=None)
+  parser.add_argument("--num-plot-samples", type=int, default=5)
+  parser.add_argument(
+      "--plot-every",
+      type=int,
+      default=100,
+      help="Save train reconstruction plots every N epochs; 0 disables periodic plots.",
+  )
   return parser.parse_args()
 
 
@@ -322,27 +524,38 @@ def main() -> None:
       decode_absolute_positions=True,
   )
   train_x, _, val_x, _ = split_dataset(x, labels, args.val_fraction, args.seed)
-  train_xy = physical_xy_positions(train_x, mean, std)
-  val_xy = physical_xy_positions(val_x, mean, std)
-  xy_mean = train_xy.mean(dim=(0, 1))
-  xy_std = train_xy.std(dim=(0, 1)).clamp_min(1e-6)
+  train_physical = train_x * std + mean
+  val_physical = val_x * std + mean
+  train_xy = train_physical[..., :2]
+  val_xy = val_physical[..., :2]
+  feature_indices = [0, 1] if args.target_space == "xy" else [0, 1, 2, 4, 5]
+  physical_feature_mean = mean[..., feature_indices].squeeze(0)
+  physical_feature_std = std[..., feature_indices].squeeze(0).clamp_min(1e-6)
+  train_target = select_target_features(train_x, args.target_space)
+  val_target = select_target_features(val_x, args.target_space)
+  model_feature_mean = torch.zeros(train_target.shape[-1])
+  model_feature_std = torch.ones(train_target.shape[-1])
   print(f"Parsed stats: {stats}")
-  print(f"Split: train={len(train_xy)} val={len(val_xy)}")
+  print(
+      f"Split: train={len(train_target)} val={len(val_target)} "
+      f"target_space={args.target_space}"
+  )
 
   model = ResidualFSQTokenizer(
       num_steps=args.num_steps,
+      target_dim=train_target.shape[-1],
       hidden_dim=args.hidden_dim,
       code_dim=args.code_dim,
       fsq_levels=args.fsq_levels,
       fsq_input_scale=args.fsq_input_scale,
-      xy_mean=xy_mean,
-      xy_std=xy_std,
+      feature_mean=model_feature_mean,
+      feature_std=model_feature_std,
   ).to(device)
   optimizer = torch.optim.AdamW(
       model.parameters(), lr=args.lr, weight_decay=args.weight_decay
   )
   loader = DataLoader(
-      TensorDataset(train_xy),
+      TensorDataset(train_target),
       batch_size=args.batch_size,
       shuffle=True,
       generator=torch.Generator().manual_seed(args.seed),
@@ -351,6 +564,7 @@ def main() -> None:
   best_state = None
   output_dir = Path(args.output_dir)
   output_dir.mkdir(parents=True, exist_ok=True)
+  plot_dir = Path(args.plot_dir) if args.plot_dir else output_dir
   for epoch in range(1, args.epochs + 1):
     model.train()
     quantize_strength = quantize_strength_for_epoch(
@@ -377,16 +591,18 @@ def main() -> None:
       model.eval()
       with torch.no_grad():
         val_recons, _, _ = model(
-            val_xy.to(device),
+            val_target.to(device),
             max_tokens=args.max_tokens,
             quantize_strength=1.0,
         )
-        val_loss = float(F.mse_loss(val_recons[-1].cpu(), val_xy))
-        stop_counts = stop_token_counts(
+        val_loss = float(F.mse_loss(val_recons[-1].cpu(), val_target))
+        stop_counts = stop_token_counts_by_xy(
             val_recons,
             val_xy.to(device),
             args.stop_threshold,
             args.stop_horizon_steps or None,
+            physical_feature_mean,
+            physical_feature_std,
         )
       print(
           f"epoch={epoch:04d} train_loss={total_loss / batches:.6f} "
@@ -400,12 +616,34 @@ def main() -> None:
             key: value.detach().cpu().clone()
             for key, value in model.state_dict().items()
         }
+    if args.plot_every > 0 and epoch % args.plot_every == 0:
+      plot_paths = save_reconstruction_plots(
+          model,
+          train_target,
+          train_xy,
+          physical_feature_mean,
+          physical_feature_std,
+          max_tokens=args.max_tokens,
+          threshold=args.stop_threshold,
+          stop_horizon_steps=args.stop_horizon_steps or None,
+          batch_size=args.batch_size,
+          device=device,
+          output_dir=plot_dir,
+          num_samples=args.num_plot_samples,
+          split_name="train",
+          epoch=epoch,
+      )
+      for plot_path in plot_paths:
+        print(f"Saved plot: {plot_path}")
 
   if best_state is not None:
     model.load_state_dict(best_state)
   rows = evaluate_model(
       model,
+      val_target,
       val_xy,
+      physical_feature_mean,
+      physical_feature_std,
       max_tokens=args.max_tokens,
       batch_size=args.batch_size,
       threshold=args.stop_threshold,
@@ -420,13 +658,32 @@ def main() -> None:
       {
           "model_state_dict": model.state_dict(),
           "args": vars(args),
-          "xy_mean": xy_mean,
-          "xy_std": xy_std,
+          "feature_mean": physical_feature_mean,
+          "feature_std": physical_feature_std,
+          "xy_mean": physical_feature_mean[:2],
+          "xy_std": physical_feature_std[:2],
       },
       output_dir / "best_model.pt",
   )
   print(f"Saved metrics: {csv_path}")
   print(f"Saved model: {output_dir / 'best_model.pt'}")
+  plot_paths = save_reconstruction_plots(
+      model,
+      val_target,
+      val_xy,
+      physical_feature_mean,
+      physical_feature_std,
+      max_tokens=args.max_tokens,
+      threshold=args.stop_threshold,
+      stop_horizon_steps=args.stop_horizon_steps or None,
+      batch_size=args.batch_size,
+      device=device,
+      output_dir=plot_dir,
+      num_samples=args.num_plot_samples,
+      split_name="val",
+  )
+  for plot_path in plot_paths:
+    print(f"Saved plot: {plot_path}")
 
 
 if __name__ == "__main__":
