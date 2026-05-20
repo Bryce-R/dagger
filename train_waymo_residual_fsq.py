@@ -41,6 +41,10 @@ def select_target_features(x: torch.Tensor, target_space: str) -> torch.Tensor:
     if x.shape[-1] < 6:
       raise ValueError("--target-space xy_yaw_velocity requires --include-all-states.")
     return x[..., [0, 1, 2, 4, 5]]
+  if target_space == "full_state":
+    if x.shape[-1] < 6:
+      raise ValueError("--target-space full_state requires --include-all-states.")
+    return x
   raise ValueError(f"unknown target space: {target_space}")
 
 
@@ -50,7 +54,14 @@ def target_features_to_xy(
     feature_std: torch.Tensor,
 ) -> torch.Tensor:
   physical = target * feature_std.view(1, 1, -1) + feature_mean.view(1, 1, -1)
-  return physical[..., :2]
+  xy = physical[..., :2]
+  return xy - xy[:, :1]
+
+
+def anchor_xy_channels(x: torch.Tensor) -> torch.Tensor:
+  anchored = x.clone()
+  anchored[..., :2] = anchored[..., :2] - anchored[:, :1, :2]
+  return anchored
 
 
 class ResidualFSQTokenizer(nn.Module):
@@ -149,23 +160,74 @@ def quantize_strength_for_epoch(
   return min(1.0, (epoch - warmup_epochs) / anneal_epochs)
 
 
+def per_example_reconstruction_errors(
+    reconstructions: list[torch.Tensor],
+    target_xy: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+  target_xy = anchor_xy_channels(target_xy)
+  errors = []
+  for recon in reconstructions:
+    recon = anchor_xy_channels(recon)
+    if loss_type == "mse":
+      error = (recon - target_xy).square().mean(dim=(1, 2))
+    elif loss_type == "smooth_l1":
+      error = F.smooth_l1_loss(recon, target_xy, reduction="none").mean(dim=(1, 2))
+    else:
+      raise ValueError(f"unknown loss type: {loss_type}")
+    errors.append(error)
+  return torch.stack(errors, dim=1)
+
+
+def objective_token_counts(
+    reconstructions: list[torch.Tensor],
+    target_xy: torch.Tensor,
+    loss_type: str,
+    token_length_weight: float,
+) -> torch.Tensor:
+  errors = per_example_reconstruction_errors(reconstructions, target_xy, loss_type)
+  token_costs = torch.arange(
+      1,
+      len(reconstructions) + 1,
+      dtype=errors.dtype,
+      device=errors.device,
+  )
+  costs = errors + float(token_length_weight) * token_costs.view(1, -1)
+  return costs.argmin(dim=1) + 1
+
+
 def reconstruction_loss(
     reconstructions: list[torch.Tensor],
     target_xy: torch.Tensor,
     loss_type: str,
     final_weight: float,
+    loss_objective: str,
+    token_length_weight: float,
+    length_final_loss_weight: float,
 ) -> torch.Tensor:
-  losses = []
-  for recon in reconstructions:
-    if loss_type == "mse":
-      losses.append(F.mse_loss(recon, target_xy))
-    elif loss_type == "smooth_l1":
-      losses.append(F.smooth_l1_loss(recon, target_xy))
-    else:
-      raise ValueError(f"unknown loss type: {loss_type}")
-  if final_weight != 1.0:
-    losses[-1] = losses[-1] * final_weight
-  return torch.stack(losses).mean()
+  if loss_objective == "all_prefix":
+    losses = per_example_reconstruction_errors(
+        reconstructions, target_xy, loss_type
+    ).mean(dim=0)
+    if final_weight != 1.0:
+      losses[-1] = losses[-1] * final_weight
+    return losses.mean()
+  if loss_objective == "length_regularized":
+    errors = per_example_reconstruction_errors(reconstructions, target_xy, loss_type)
+    token_costs = torch.arange(
+        1,
+        len(reconstructions) + 1,
+        dtype=errors.dtype,
+        device=errors.device,
+    )
+    best_cost = (errors + float(token_length_weight) * token_costs.view(1, -1)).min(
+        dim=1
+    ).values
+    loss = best_cost.mean()
+    if length_final_loss_weight > 0.0:
+      loss = loss + float(length_final_loss_weight) * errors[:, -1].mean()
+    return loss
+  raise ValueError(f"unknown loss objective: {loss_objective}")
 
 
 def stop_token_counts(
@@ -479,11 +541,29 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--max-tokens", type=int, default=4)
   parser.add_argument(
       "--target-space",
-      choices=("xy", "xy_yaw_velocity"),
+      choices=("xy", "xy_yaw_velocity", "full_state"),
       default="xy",
       help="Feature space reconstructed by residual tokens.",
   )
   parser.add_argument("--loss-type", choices=("smooth_l1", "mse"), default="smooth_l1")
+  parser.add_argument(
+      "--loss-objective",
+      choices=("all_prefix", "length_regularized"),
+      default="all_prefix",
+      help="all_prefix preserves the baseline; length_regularized minimizes prefix error plus token cost.",
+  )
+  parser.add_argument(
+      "--token-length-weight",
+      type=float,
+      default=0.0,
+      help="Per-token cost for --loss-objective length_regularized.",
+  )
+  parser.add_argument(
+      "--length-final-loss-weight",
+      type=float,
+      default=1.0,
+      help="Extra final-prefix reconstruction weight for length_regularized.",
+  )
   parser.add_argument("--final-loss-weight", type=float, default=1.0)
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -526,9 +606,14 @@ def main() -> None:
   train_x, _, val_x, _ = split_dataset(x, labels, args.val_fraction, args.seed)
   train_physical = train_x * std + mean
   val_physical = val_x * std + mean
-  train_xy = train_physical[..., :2]
-  val_xy = val_physical[..., :2]
-  feature_indices = [0, 1] if args.target_space == "xy" else [0, 1, 2, 4, 5]
+  train_xy = train_physical[..., :2] - train_physical[:, :1, :2]
+  val_xy = val_physical[..., :2] - val_physical[:, :1, :2]
+  if args.target_space == "xy":
+    feature_indices = [0, 1]
+  elif args.target_space == "xy_yaw_velocity":
+    feature_indices = [0, 1, 2, 4, 5]
+  else:
+    feature_indices = list(range(train_x.shape[-1]))
   physical_feature_mean = mean[..., feature_indices].squeeze(0)
   physical_feature_std = std[..., feature_indices].squeeze(0).clamp_min(1e-6)
   train_target = select_target_features(train_x, args.target_space)
@@ -580,7 +665,13 @@ def main() -> None:
           quantize_strength=quantize_strength,
       )
       loss = reconstruction_loss(
-          recons, batch_xy, args.loss_type, args.final_loss_weight
+          recons,
+          batch_xy,
+          args.loss_type,
+          args.final_loss_weight,
+          args.loss_objective,
+          args.token_length_weight,
+          args.length_final_loss_weight,
       ) + vq_loss
       optimizer.zero_grad(set_to_none=True)
       loss.backward()
@@ -595,7 +686,12 @@ def main() -> None:
             max_tokens=args.max_tokens,
             quantize_strength=1.0,
         )
-        val_loss = float(F.mse_loss(val_recons[-1].cpu(), val_target))
+        val_loss = float(
+            F.mse_loss(
+                anchor_xy_channels(val_recons[-1].cpu()),
+                anchor_xy_channels(val_target),
+            )
+        )
         stop_counts = stop_token_counts_by_xy(
             val_recons,
             val_xy.to(device),
@@ -604,11 +700,24 @@ def main() -> None:
             physical_feature_mean,
             physical_feature_std,
         )
+        objective_counts = None
+        if args.loss_objective == "length_regularized":
+          objective_counts = objective_token_counts(
+              val_recons,
+              val_target.to(device),
+              args.loss_type,
+              args.token_length_weight,
+          )
       print(
           f"epoch={epoch:04d} train_loss={total_loss / batches:.6f} "
           f"val_final_mse={val_loss:.6f} "
           f"avg_stop_tokens={float(stop_counts.float().mean()):.3f} "
           f"stop_success_rate={float((stop_counts < args.max_tokens).float().mean()):.3f}"
+          + (
+              ""
+              if objective_counts is None
+              else f" avg_objective_tokens={float(objective_counts.float().mean()):.3f}"
+          )
       )
       if val_loss < best_val_loss:
         best_val_loss = val_loss

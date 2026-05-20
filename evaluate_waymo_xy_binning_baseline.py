@@ -49,7 +49,8 @@ def physical_xy_positions(
     decode_absolute_positions: bool,
 ) -> torch.Tensor:
   physical = x * std + mean
-  return xy_to_positions(physical, decode_absolute_positions)
+  xy = xy_to_positions(physical, decode_absolute_positions)
+  return xy - xy[:, :1]
 
 
 def fit_uniform_bins(
@@ -76,7 +77,9 @@ def quantize_xy_to_centers(
   min_xy = min_xy.to(xy.device)
   width = width.to(xy.device)
   indices = torch.floor((xy - min_xy) / width).long().clamp(0, num_bins - 1)
-  return min_xy + (indices.float() + 0.5) * width
+  recon = min_xy + (indices.float() + 0.5) * width
+  recon[:, 0] = 0.0
+  return recon
 
 
 def max_abs_xy_error_by_second(
