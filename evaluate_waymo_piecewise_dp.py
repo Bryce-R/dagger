@@ -137,17 +137,30 @@ def reconstruction_metrics(
     recon_xy: torch.Tensor,
     target_xy: torch.Tensor,
 ) -> dict[str, float | str]:
+  error = recon_xy - target_xy
   abs_error = (recon_xy - target_xy).abs()
   num_steps = target_xy.shape[1]
   max_seconds = math.ceil(num_steps / WAYMO_STEPS_PER_SECOND)
+  mse_by_second = {}
+  p90_by_second = {}
   p99_by_second = {}
   max_by_second = {}
   for second in range(1, max_seconds + 1):
     step = min(second * WAYMO_STEPS_PER_SECOND - 1, num_steps - 1)
     step_error = abs_error[:, step].reshape(-1)
+    mse_by_second[second] = float(error[:, step].square().mean())
+    p90_by_second[second] = float(torch.quantile(step_error, 0.90))
     p99_by_second[second] = float(torch.quantile(step_error, 0.99))
     max_by_second[second] = float(step_error.max())
   first_three_steps = min(3 * WAYMO_STEPS_PER_SECOND, num_steps)
+  mse_by_step = [
+      float(error[:, step].square().mean())
+      for step in range(num_steps)
+  ]
+  p90_by_step = [
+      float(torch.quantile(abs_error[:, step].reshape(-1), 0.90))
+      for step in range(num_steps)
+  ]
   p99_by_step = [
       float(torch.quantile(abs_error[:, step].reshape(-1), 0.99))
       for step in range(first_three_steps)
@@ -158,10 +171,60 @@ def reconstruction_metrics(
       "max_error": float(abs_error.max()),
       "p99_error": float(torch.quantile(abs_error.reshape(-1), 0.99)),
       "max_first3s_p99": max(p99_by_step),
+      "mse_by_second": format_second_errors(mse_by_second),
+      "p90_by_second": format_second_errors(p90_by_second),
       "p99_by_second": format_second_errors(p99_by_second),
       "max_by_second": format_second_errors(max_by_second),
+      "mse_by_step": " ".join(f"t{step}={value:.6f}" for step, value in enumerate(mse_by_step)),
+      "p90_by_step": " ".join(f"t{step}={value:.6f}" for step, value in enumerate(p90_by_step)),
       "p99_first3s_steps": " ".join(f"{value:.6f}" for value in p99_by_step),
   }
+
+
+def token_labels_from_boundaries(boundaries: torch.Tensor) -> list[list[int]]:
+  labels = []
+  for row in boundaries:
+    current_label = 0
+    sequence = []
+    for step in range(row.shape[0] + 1):
+      sequence.append(current_label)
+      if step < row.shape[0] and row[step] > 0.0:
+        current_label += 1
+    labels.append(sequence)
+  return labels
+
+
+def run_length_encode_labels(labels: list[int]) -> str:
+  if not labels:
+    return ""
+  parts = []
+  current = labels[0]
+  count = 1
+  for label in labels[1:]:
+    if label == current:
+      count += 1
+    else:
+      parts.append(f"{current}*{count}" if count > 1 else str(current))
+      current = label
+      count = 1
+  parts.append(f"{current}*{count}" if count > 1 else str(current))
+  return " ".join(parts)
+
+
+def print_token_examples(
+    boundaries: torch.Tensor,
+    token_counts: torch.Tensor,
+    prefix: str,
+    num_examples: int,
+) -> None:
+  labels = token_labels_from_boundaries(boundaries)
+  for index, sequence in enumerate(labels[:num_examples]):
+    before = ",".join(str(label) for label in sequence)
+    after = run_length_encode_labels(sequence)
+    print(
+        f"{prefix} sample={index} tokens={int(token_counts[index])} "
+        f"before={before} after={after}"
+    )
 
 
 def evaluate_dp_sweep(
@@ -378,6 +441,91 @@ def plot_reconstructions(
   plt.close(fig)
 
 
+def xy_to_motion_channels(xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+  delta = torch.zeros_like(xy)
+  delta[1:] = xy[1:] - xy[:-1]
+  yaw = torch.atan2(delta[:, 1], delta[:, 0])
+  if len(yaw) > 1:
+    yaw[0] = yaw[1]
+  return delta, yaw
+
+
+def plot_motion_diagnostics(
+    target_xy: torch.Tensor,
+    recon_xy: torch.Tensor,
+    boundaries: torch.Tensor,
+    token_counts: torch.Tensor,
+    output_path: Path,
+    title: str,
+    sample_indices: list[int],
+) -> None:
+  """Saves XY, dx, dy, and implied-yaw diagnostics for selected samples."""
+  import matplotlib
+
+  matplotlib.use("Agg")
+  import matplotlib.pyplot as plt
+
+  if not sample_indices:
+    return
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  num_rows = len(sample_indices)
+  fig, axes = plt.subplots(
+      num_rows,
+      4,
+      figsize=(18.0, 3.2 * num_rows),
+      squeeze=False,
+  )
+  for row, sample_index in enumerate(sample_indices):
+    target = target_xy[sample_index]
+    recon = recon_xy[sample_index]
+    target_delta, target_yaw = xy_to_motion_channels(target)
+    recon_delta, recon_yaw = xy_to_motion_channels(recon)
+    steps = torch.arange(target.shape[0])
+    boundary_steps = [
+        boundary_index + 1
+        for boundary_index in torch.nonzero(boundaries[sample_index] > 0.0).flatten().tolist()
+    ]
+
+    path_axis = axes[row, 0]
+    path_axis.plot(target[:, 0], target[:, 1], "o-", color="tab:blue", label="target")
+    path_axis.plot(recon[:, 0], recon[:, 1], "x--", color="tab:orange", label="piecewise")
+    if boundary_steps:
+      boundary_points = target[boundary_steps]
+      path_axis.scatter(
+          boundary_points[:, 0],
+          boundary_points[:, 1],
+          s=70,
+          facecolors="none",
+          edgecolors="tab:red",
+          linewidths=1.6,
+          label="boundary",
+      )
+    path_axis.set_title(f"sample={sample_index} tokens={int(token_counts[sample_index])}")
+    path_axis.set_aspect("equal", adjustable="datalim")
+    path_axis.grid(True, alpha=0.3)
+
+    channel_specs = [
+        ("dx", target_delta[:, 0], recon_delta[:, 0]),
+        ("dy", target_delta[:, 1], recon_delta[:, 1]),
+        ("yaw", target_yaw, recon_yaw),
+    ]
+    for col, (name, target_channel, recon_channel) in enumerate(channel_specs, start=1):
+      axis = axes[row, col]
+      axis.plot(steps, target_channel, "o-", color="tab:blue", label="target")
+      axis.plot(steps, recon_channel, "x--", color="tab:orange", label="piecewise")
+      for boundary_step in boundary_steps:
+        axis.axvline(boundary_step, color="tab:red", alpha=0.35, linewidth=1.0)
+      axis.set_title(name)
+      axis.grid(True, alpha=0.3)
+
+  handles, labels = axes[0, 0].get_legend_handles_labels()
+  fig.legend(handles, labels, loc="lower center", ncol=3)
+  fig.suptitle(title.replace("_", " "), y=0.995)
+  fig.tight_layout(rect=(0, 0.025, 1, 0.985))
+  fig.savefig(output_path, dpi=170)
+  plt.close(fig)
+
+
 def save_dp_plots(
     target_xy: torch.Tensor,
     recon_xy: torch.Tensor,
@@ -398,6 +546,8 @@ def save_dp_plots(
   ).indices.tolist()
   first_path = output_dir / f"{prefix}_first_samples.png"
   worst_path = output_dir / f"{prefix}_worst_first3s.png"
+  first_diag_path = output_dir / f"{prefix}_first_samples_dxdy_yaw.png"
+  worst_diag_path = output_dir / f"{prefix}_worst_first3s_dxdy_yaw.png"
   plot_reconstructions(
       target_xy,
       recon_xy,
@@ -416,7 +566,25 @@ def save_dp_plots(
       f"{prefix}: worst first-3s validation samples",
       worst_indices,
   )
-  return [first_path, worst_path]
+  plot_motion_diagnostics(
+      target_xy,
+      recon_xy,
+      boundaries,
+      token_counts,
+      first_diag_path,
+      f"{prefix}: first validation samples dx dy yaw",
+      first_indices,
+  )
+  plot_motion_diagnostics(
+      target_xy,
+      recon_xy,
+      boundaries,
+      token_counts,
+      worst_diag_path,
+      f"{prefix}: worst first-3s validation samples dx dy yaw",
+      worst_indices,
+  )
+  return [first_path, worst_path, first_diag_path, worst_diag_path]
 
 
 def write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
@@ -460,6 +628,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--num-plot-samples", type=int, default=8)
   parser.add_argument("--plot-degree", type=int, default=2)
   parser.add_argument("--plot-threshold", type=float, default=0.2)
+  parser.add_argument("--print-token-degree", type=int, default=2)
+  parser.add_argument("--print-token-threshold", type=float, default=0.2)
+  parser.add_argument("--print-token-examples", type=int, default=8)
   parser.add_argument("--learn-boundaries", action="store_true")
   parser.add_argument("--learn-degree", type=int, default=2)
   parser.add_argument("--learn-threshold", type=float, default=0.2)
@@ -505,8 +676,33 @@ def main() -> None:
     print(
         f"mode={row['mode']} degree={row['degree']} value={row['value']} "
         f"avg_tokens={row['avg_tokens']:.3f} "
+        f"xy_mse={row['xy_mse']:.6f} "
+        f"mse_by_second={row['mse_by_second']} "
+        f"p90_by_second={row['p90_by_second']} "
+        f"mse_by_step={row['mse_by_step']} "
+        f"p90_by_step={row['p90_by_step']} "
         f"max_first3s_p99={row['max_first3s_p99']:.6f} "
         f"p99_by_second={row['p99_by_second']}"
+    )
+
+  if args.print_token_examples > 0:
+    token_key = (args.print_token_degree, args.print_token_threshold)
+    if token_key in threshold_cache:
+      _, token_boundaries, token_counts = threshold_cache[token_key]
+    else:
+      _, token_boundaries, token_counts = dynamic_program_segments(
+          val_xy,
+          degree=args.print_token_degree,
+          max_error_threshold=args.print_token_threshold,
+      )
+    print_token_examples(
+        token_boundaries,
+        token_counts,
+        prefix=(
+            f"dp_degree{args.print_token_degree}_"
+            f"threshold{args.print_token_threshold:g}"
+        ),
+        num_examples=args.print_token_examples,
     )
 
   if args.plot_dir:
@@ -563,6 +759,11 @@ def main() -> None:
           f"mode={row['mode']} degree={row['degree']} threshold={row['value']} "
           f"avg_tokens={row['avg_tokens']:.3f} "
           f"boundary_accuracy={row['boundary_accuracy']:.4f} "
+          f"xy_mse={row['xy_mse']:.6f} "
+          f"mse_by_second={row['mse_by_second']} "
+          f"p90_by_second={row['p90_by_second']} "
+          f"mse_by_step={row['mse_by_step']} "
+          f"p90_by_step={row['p90_by_step']} "
           f"max_first3s_p99={row['max_first3s_p99']:.6f} "
           f"p99_by_second={row['p99_by_second']}"
       )
