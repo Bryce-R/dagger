@@ -158,6 +158,45 @@ class EndpointGaussianGRU(nn.Module):
     return mean.unsqueeze(1), raw_log_std.clamp(-5.0, 2.0).unsqueeze(1)
 
 
+class EndpointDiscreteGRU(nn.Module):
+  def __init__(
+      self,
+      state_dim: int,
+      target_dim: int,
+      num_bins: int,
+      hidden_dim: int,
+      num_layers: int,
+      dropout: float,
+  ):
+    super().__init__()
+    self.target_dim = target_dim
+    self.num_bins = num_bins
+    self.gru = nn.GRU(
+        input_size=state_dim,
+        hidden_size=hidden_dim,
+        num_layers=num_layers,
+        batch_first=True,
+        dropout=dropout if num_layers > 1 else 0.0,
+    )
+    self.head = nn.Sequential(
+        nn.LayerNorm(hidden_dim),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, target_dim * num_bins),
+    )
+
+  def forward(
+      self,
+      history: torch.Tensor,
+      target: torch.Tensor | None = None,
+      teacher_force: bool = False,
+  ) -> torch.Tensor:
+    del target, teacher_force
+    _, hidden = self.gru(history)
+    logits = self.head(hidden[-1]).view(-1, 1, self.target_dim, self.num_bins)
+    return logits
+
+
 def gaussian_nll(
     target: torch.Tensor,
     mean: torch.Tensor,
@@ -170,6 +209,29 @@ def gaussian_nll(
 
 def gaussian_entropy(log_std: torch.Tensor) -> torch.Tensor:
   per_dim = log_std + 0.5 * math.log(2.0 * math.pi * math.e)
+  return per_dim.flatten(start_dim=1).sum(dim=1)
+
+
+def encode_uniform_bins(target: torch.Tensor, num_bins: int, clip_value: float) -> torch.Tensor:
+  clipped = target.clamp(-clip_value, clip_value)
+  normalized = (clipped + clip_value) / (2.0 * clip_value)
+  bins = torch.floor(normalized * num_bins).long()
+  return bins.clamp(0, num_bins - 1)
+
+
+def discrete_ce_nll(logits: torch.Tensor, target_bins: torch.Tensor) -> torch.Tensor:
+  per_dim = nn.functional.cross_entropy(
+      logits.flatten(0, -2),
+      target_bins.flatten(),
+      reduction="none",
+  )
+  return per_dim.view(target_bins.shape).flatten(start_dim=1).sum(dim=1)
+
+
+def discrete_entropy(logits: torch.Tensor) -> torch.Tensor:
+  probs = torch.softmax(logits, dim=-1)
+  log_probs = torch.log_softmax(logits, dim=-1)
+  per_dim = -(probs * log_probs).sum(dim=-1)
   return per_dim.flatten(start_dim=1).sum(dim=1)
 
 
@@ -328,6 +390,10 @@ def make_relative_windows(
         target.append(target_frame[-1:, :2])
       elif target_mode == "final-velocity":
         target.append(target_frame[-1:, 3:5])
+      elif target_mode == "final-speed-yaw":
+        final_speed = target_frame[-1:, 3:5].norm(dim=-1, keepdim=True)
+        final_yaw = target_frame[-1:, 2:3]
+        target.append(torch.cat([final_speed, final_yaw], dim=-1))
       else:
         raise ValueError(f"unknown target_mode: {target_mode}")
       traj_index.append(traj_idx)
@@ -418,8 +484,13 @@ def train_model(
     for history, target, _, _ in train_loader:
       history = history.to(device)
       target = target.to(device)
-      mean, log_std = model(history, target=target, teacher_force=True)
-      loss = gaussian_nll(target, mean, log_std).mean()
+      if args.loss_mode == "discrete":
+        logits = model(history, target=target, teacher_force=True)
+        target_bins = encode_uniform_bins(target, args.num_bins, args.bin_clip)
+        loss = discrete_ce_nll(logits, target_bins).mean()
+      else:
+        mean, log_std = model(history, target=target, teacher_force=True)
+        loss = gaussian_nll(target, mean, log_std).mean()
       optimizer.zero_grad()
       loss.backward()
       nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -434,9 +505,15 @@ def train_model(
         for history, target, _, _ in val_loader:
           history = history.to(device)
           target = target.to(device)
-          mean, log_std = model(history, target=target, teacher_force=True)
-          val_loss += gaussian_nll(target, mean, log_std).sum().item()
-          val_entropy += gaussian_entropy(log_std).sum().item()
+          if args.loss_mode == "discrete":
+            logits = model(history, target=target, teacher_force=True)
+            target_bins = encode_uniform_bins(target, args.num_bins, args.bin_clip)
+            val_loss += discrete_ce_nll(logits, target_bins).sum().item()
+            val_entropy += discrete_entropy(logits).sum().item()
+          else:
+            mean, log_std = model(history, target=target, teacher_force=True)
+            val_loss += gaussian_nll(target, mean, log_std).sum().item()
+            val_entropy += gaussian_entropy(log_std).sum().item()
       print(
           f"epoch={epoch:04d} "
           f"train_nll={train_loss / len(train_ds):.4f} "
@@ -454,6 +531,7 @@ def score_trajectories(
     num_trajectories: int,
     num_steps: int,
     batch_size: int,
+    args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   dataset = NextTrajectoryWindowDataset(history, target, traj_index, step_index)
@@ -465,9 +543,15 @@ def score_trajectories(
     for history, target, traj_idx, step_idx in loader:
       history = history.to(device)
       target = target.to(device)
-      mean, log_std = model(history, target=target, teacher_force=True)
-      batch_nll = gaussian_nll(target, mean, log_std).cpu()
-      batch_entropy = gaussian_entropy(log_std).cpu()
+      if args.loss_mode == "discrete":
+        logits = model(history, target=target, teacher_force=True)
+        target_bins = encode_uniform_bins(target, args.num_bins, args.bin_clip)
+        batch_nll = discrete_ce_nll(logits, target_bins).cpu()
+        batch_entropy = discrete_entropy(logits).cpu()
+      else:
+        mean, log_std = model(history, target=target, teacher_force=True)
+        batch_nll = gaussian_nll(target, mean, log_std).cpu()
+        batch_entropy = gaussian_entropy(log_std).cpu()
       nll[traj_idx, step_idx] = batch_nll
       entropy[traj_idx, step_idx] = batch_entropy
   return nll, entropy
@@ -672,7 +756,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--horizon-len", type=int, default=10, help="Predicted future length in 10Hz steps.")
   parser.add_argument(
       "--target-mode",
-      choices=("full-trajectory", "final-xy", "final-velocity"),
+      choices=("full-trajectory", "final-xy", "final-velocity", "final-speed-yaw"),
       default="full-trajectory",
       help="Prediction target used for boundary NLL.",
   )
@@ -692,6 +776,19 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--hidden-dim", type=int, default=128)
   parser.add_argument("--num-layers", type=int, default=1)
   parser.add_argument("--dropout", type=float, default=0.0)
+  parser.add_argument(
+      "--loss-mode",
+      choices=("gaussian", "discrete"),
+      default="gaussian",
+      help="Use Gaussian NLL or per-dimension discrete-bin cross entropy.",
+  )
+  parser.add_argument("--num-bins", type=int, default=64, help="Bins per target dimension for discrete loss.")
+  parser.add_argument(
+      "--bin-clip",
+      type=float,
+      default=4.0,
+      help="Clip normalized targets to [-bin_clip, bin_clip] before discrete binning.",
+  )
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--weight-decay", type=float, default=1e-4)
   parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -710,6 +807,8 @@ def main() -> None:
   args = parse_args()
   if args.history_len + args.horizon_len > args.num_steps:
     raise ValueError("--history-len + --horizon-len must be <= --num-steps")
+  if args.loss_mode == "discrete" and args.target_mode == "full-trajectory":
+    raise ValueError("--loss-mode discrete currently supports endpoint target modes only")
 
   torch.manual_seed(args.seed)
   device = torch.device(args.device)
@@ -733,7 +832,8 @@ def main() -> None:
   print(
       f"split: train={len(train_x)} val={len(val_x)} "
       f"state_dim={x.shape[-1]} hz={WAYMO_HZ} "
-      f"target_mode={args.target_mode} track_source={args.track_source} "
+      f"target_mode={args.target_mode} loss_mode={args.loss_mode} "
+      f"track_source={args.track_source} "
       f"object_types={sorted(set(args.object_type))}"
   )
 
@@ -783,6 +883,21 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
     score_label = "1s trajectory NLL"
+  elif args.loss_mode == "discrete":
+    model = EndpointDiscreteGRU(
+        state_dim=x.shape[-1],
+        target_dim=train_target.shape[-1],
+        num_bins=args.num_bins,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+    ).to(device)
+    if args.target_mode == "final-xy":
+      score_label = "1s endpoint XY CE"
+    elif args.target_mode == "final-velocity":
+      score_label = "1s endpoint velocity CE"
+    else:
+      score_label = "1s endpoint speed+yaw CE"
   else:
     model = EndpointGaussianGRU(
         state_dim=x.shape[-1],
@@ -791,7 +906,12 @@ def main() -> None:
         num_layers=args.num_layers,
         dropout=args.dropout,
     ).to(device)
-    score_label = "1s endpoint XY NLL" if args.target_mode == "final-xy" else "1s endpoint velocity NLL"
+    if args.target_mode == "final-xy":
+      score_label = "1s endpoint XY NLL"
+    elif args.target_mode == "final-velocity":
+      score_label = "1s endpoint velocity NLL"
+    else:
+      score_label = "1s endpoint speed+yaw NLL"
   train_model(
       model,
       train_history,
@@ -815,6 +935,7 @@ def main() -> None:
       len(val_x),
       val_x.shape[1],
       args.batch_size,
+      args,
       device,
   )
   val_physical = val_x
