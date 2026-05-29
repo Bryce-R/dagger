@@ -197,6 +197,41 @@ class EndpointDiscreteGRU(nn.Module):
     return logits
 
 
+class EndpointRegressionGRU(nn.Module):
+  def __init__(
+      self,
+      state_dim: int,
+      target_dim: int,
+      hidden_dim: int,
+      num_layers: int,
+      dropout: float,
+  ):
+    super().__init__()
+    self.gru = nn.GRU(
+        input_size=state_dim,
+        hidden_size=hidden_dim,
+        num_layers=num_layers,
+        batch_first=True,
+        dropout=dropout if num_layers > 1 else 0.0,
+    )
+    self.head = nn.Sequential(
+        nn.LayerNorm(hidden_dim),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, target_dim),
+    )
+
+  def forward(
+      self,
+      history: torch.Tensor,
+      target: torch.Tensor | None = None,
+      teacher_force: bool = False,
+  ) -> torch.Tensor:
+    del target, teacher_force
+    _, hidden = self.gru(history)
+    return self.head(hidden[-1]).unsqueeze(1)
+
+
 def gaussian_nll(
     target: torch.Tensor,
     mean: torch.Tensor,
@@ -388,6 +423,8 @@ def make_relative_windows(
         target.append(target_frame)
       elif target_mode == "final-xy":
         target.append(target_frame[-1:, :2])
+      elif target_mode == "final-xy-yaw":
+        target.append(target_frame[-1:, :3])
       elif target_mode == "final-velocity":
         target.append(target_frame[-1:, 3:5])
       elif target_mode == "final-speed-yaw":
@@ -488,6 +525,9 @@ def train_model(
         logits = model(history, target=target, teacher_force=True)
         target_bins = encode_uniform_bins(target, args.num_bins, args.bin_clip)
         loss = discrete_ce_nll(logits, target_bins).mean()
+      elif args.loss_mode == "regression":
+        pred = model(history, target=target, teacher_force=True)
+        loss = nn.functional.mse_loss(pred, target)
       else:
         mean, log_std = model(history, target=target, teacher_force=True)
         loss = gaussian_nll(target, mean, log_std).mean()
@@ -510,14 +550,18 @@ def train_model(
             target_bins = encode_uniform_bins(target, args.num_bins, args.bin_clip)
             val_loss += discrete_ce_nll(logits, target_bins).sum().item()
             val_entropy += discrete_entropy(logits).sum().item()
+          elif args.loss_mode == "regression":
+            pred = model(history, target=target, teacher_force=True)
+            batch_mse = (pred - target).pow(2).flatten(start_dim=1).mean(dim=1)
+            val_loss += batch_mse.sum().item()
           else:
             mean, log_std = model(history, target=target, teacher_force=True)
             val_loss += gaussian_nll(target, mean, log_std).sum().item()
             val_entropy += gaussian_entropy(log_std).sum().item()
       print(
           f"epoch={epoch:04d} "
-          f"train_nll={train_loss / len(train_ds):.4f} "
-          f"val_nll={val_loss / len(val_ds):.4f} "
+          f"train_{'mse' if args.loss_mode == 'regression' else 'nll'}={train_loss / len(train_ds):.4f} "
+          f"val_{'mse' if args.loss_mode == 'regression' else 'nll'}={val_loss / len(val_ds):.4f} "
           f"val_entropy={val_entropy / len(val_ds):.4f}"
       )
 
@@ -532,12 +576,16 @@ def score_trajectories(
     num_steps: int,
     batch_size: int,
     args: argparse.Namespace,
+    target_mean: torch.Tensor | None,
+    target_std: torch.Tensor | None,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   dataset = NextTrajectoryWindowDataset(history, target, traj_index, step_index)
   loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
   nll = torch.full((num_trajectories, num_steps), float("nan"))
   entropy = torch.full((num_trajectories, num_steps), float("nan"))
+  xy_error = torch.full((num_trajectories, num_steps), float("nan"))
+  yaw_error = torch.full((num_trajectories, num_steps), float("nan"))
   model.eval()
   with torch.no_grad():
     for history, target, traj_idx, step_idx in loader:
@@ -548,13 +596,38 @@ def score_trajectories(
         target_bins = encode_uniform_bins(target, args.num_bins, args.bin_clip)
         batch_nll = discrete_ce_nll(logits, target_bins).cpu()
         batch_entropy = discrete_entropy(logits).cpu()
+      elif args.loss_mode == "regression":
+        if target_mean is None or target_std is None:
+          raise ValueError("target_mean and target_std are required for regression scoring")
+        pred = model(history, target=target, teacher_force=True)
+        target_mean_device = target_mean.to(pred.device)
+        target_std_device = target_std.to(pred.device)
+        pred_physical = pred * target_std_device + target_mean_device
+        target_physical = target * target_std_device + target_mean_device
+        batch_xy_error = (pred_physical[:, :, :2] - target_physical[:, :, :2]).flatten(start_dim=1).norm(dim=1)
+        if args.target_mode == "final-xy-yaw":
+          batch_yaw_error = wrap_angle(pred_physical[:, 0, 2] - target_physical[:, 0, 2]).abs()
+          yaw_threshold = math.radians(args.regression_yaw_threshold_deg)
+          batch_nll = torch.maximum(
+              batch_xy_error / args.regression_xy_threshold,
+              batch_yaw_error / yaw_threshold,
+          )
+        else:
+          batch_yaw_error = torch.full_like(batch_xy_error, float("nan"))
+          batch_nll = batch_xy_error
+        batch_entropy = torch.full_like(batch_nll, float("nan"))
+        batch_nll = batch_nll.cpu()
+        batch_entropy = batch_entropy.cpu()
       else:
         mean, log_std = model(history, target=target, teacher_force=True)
         batch_nll = gaussian_nll(target, mean, log_std).cpu()
         batch_entropy = gaussian_entropy(log_std).cpu()
       nll[traj_idx, step_idx] = batch_nll
       entropy[traj_idx, step_idx] = batch_entropy
-  return nll, entropy
+      if args.loss_mode == "regression":
+        xy_error[traj_idx, step_idx] = batch_xy_error.cpu()
+        yaw_error[traj_idx, step_idx] = batch_yaw_error.cpu()
+  return nll, entropy, xy_error, yaw_error
 
 
 def speed_norm(states_physical: torch.Tensor) -> torch.Tensor:
@@ -598,15 +671,31 @@ def choose_boundaries(
 def summarize_boundaries(
     nll: torch.Tensor,
     entropy: torch.Tensor,
+    xy_error: torch.Tensor,
+    yaw_error: torch.Tensor,
     jerk: torch.Tensor,
     labels: torch.Tensor,
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, float | int | str]], torch.Tensor]:
   valid_scores = nll[torch.isfinite(nll)]
-  threshold = float(torch.quantile(valid_scores, args.boundary_quantile))
+  if args.loss_mode == "regression" and args.target_mode == "final-xy-yaw":
+    threshold = 1.0
+  elif args.loss_mode == "regression":
+    threshold = float(args.regression_error_threshold)
+  else:
+    threshold = float(torch.quantile(valid_scores, args.boundary_quantile))
   boundaries = torch.zeros_like(nll, dtype=torch.bool)
   rows = []
-  print(f"boundary_threshold: quantile={args.boundary_quantile:.3f} horizon_nll={threshold:.4f}")
+  if args.loss_mode == "regression" and args.target_mode == "final-xy-yaw":
+    print(
+        "boundary_threshold: "
+        f"xy_l2_m={args.regression_xy_threshold:.4f} "
+        f"yaw_deg={args.regression_yaw_threshold_deg:.4f}"
+    )
+  elif args.loss_mode == "regression":
+    print(f"boundary_threshold: regression_error_m={threshold:.4f}")
+  else:
+    print(f"boundary_threshold: quantile={args.boundary_quantile:.3f} horizon_nll={threshold:.4f}")
   for traj_idx in range(nll.shape[0]):
     split_steps = choose_boundaries(
         nll[traj_idx],
@@ -621,7 +710,9 @@ def summarize_boundaries(
               "traj_index": traj_idx,
               "step": step,
               "time_s": step / WAYMO_HZ,
-              "horizon_nll": float(nll[traj_idx, step]),
+              "boundary_score": float(nll[traj_idx, step]),
+              "xy_error_m": float(xy_error[traj_idx, step]),
+              "yaw_error_deg": math.degrees(float(yaw_error[traj_idx, step])),
               "entropy": float(entropy[traj_idx, step]),
               "jerk_proxy": float(jerk[traj_idx, step]),
               "object_type": int(labels[traj_idx]),
@@ -646,7 +737,9 @@ def summarize_boundaries(
         f"traj={row['traj_index']} "
         f"step={row['step']} "
         f"time_s={float(row['time_s']):.2f} "
-        f"horizon_nll={float(row['horizon_nll']):.4f} "
+        f"boundary_score={float(row['boundary_score']):.4f} "
+        f"xy_error_m={float(row['xy_error_m']):.4f} "
+        f"yaw_error_deg={float(row['yaw_error_deg']):.4f} "
         f"entropy={float(row['entropy']):.4f} "
         f"jerk_proxy={float(row['jerk_proxy']):.4f}"
     )
@@ -679,7 +772,7 @@ def plot_boundaries(
   sample_count = len(sample_indices)
   if sample_count == 0:
     return
-  fig, axes = plt.subplots(sample_count, 3, figsize=(15.0, 3.4 * sample_count), squeeze=False)
+  fig, axes = plt.subplots(sample_count, 4, figsize=(19.0, 3.4 * sample_count), squeeze=False)
   steps = torch.arange(states_physical.shape[1])
 
   for row, sample_index in enumerate(sample_indices):
@@ -704,13 +797,14 @@ def plot_boundaries(
 
     score_axis = axes[row, 1]
     score_axis.plot(steps, nll[sample_index], color="tab:red", label=score_label)
-    score_axis.plot(
-        steps,
-        entropy[sample_index],
-        color="tab:purple",
-        alpha=0.8,
-        label="predictive entropy",
-    )
+    if torch.isfinite(entropy[sample_index]).any():
+      score_axis.plot(
+          steps,
+          entropy[sample_index],
+          color="tab:purple",
+          alpha=0.8,
+          label="predictive entropy",
+      )
     for step in split_steps:
       score_axis.axvline(step, color="black", alpha=0.35, linewidth=1.0)
     score_axis.set_title("future surprise / entropy")
@@ -726,6 +820,15 @@ def plot_boundaries(
     action_axis.set_xlabel("10Hz step")
     action_axis.set_ylabel("m/s")
     action_axis.grid(True, alpha=0.3)
+
+    yaw_axis = axes[row, 3]
+    yaw_axis.plot(steps, states_physical[sample_index, :, 2], color="tab:purple", label="yaw")
+    for step in split_steps:
+      yaw_axis.axvline(step, color="black", alpha=0.35, linewidth=1.0)
+    yaw_axis.set_title("yaw")
+    yaw_axis.set_xlabel("10Hz step")
+    yaw_axis.set_ylabel("rad")
+    yaw_axis.grid(True, alpha=0.3)
 
   handles, labels = axes[0, 1].get_legend_handles_labels()
   handles2, labels2 = axes[0, 2].get_legend_handles_labels()
@@ -756,7 +859,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--horizon-len", type=int, default=10, help="Predicted future length in 10Hz steps.")
   parser.add_argument(
       "--target-mode",
-      choices=("full-trajectory", "final-xy", "final-velocity", "final-speed-yaw"),
+      choices=("full-trajectory", "final-xy", "final-xy-yaw", "final-velocity", "final-speed-yaw"),
       default="full-trajectory",
       help="Prediction target used for boundary NLL.",
   )
@@ -778,9 +881,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--dropout", type=float, default=0.0)
   parser.add_argument(
       "--loss-mode",
-      choices=("gaussian", "discrete"),
+      choices=("gaussian", "discrete", "regression"),
       default="gaussian",
-      help="Use Gaussian NLL or per-dimension discrete-bin cross entropy.",
+      help="Use Gaussian NLL, per-dimension discrete-bin cross entropy, or endpoint MSE regression.",
   )
   parser.add_argument("--num-bins", type=int, default=64, help="Bins per target dimension for discrete loss.")
   parser.add_argument(
@@ -788,6 +891,24 @@ def parse_args() -> argparse.Namespace:
       type=float,
       default=4.0,
       help="Clip normalized targets to [-bin_clip, bin_clip] before discrete binning.",
+  )
+  parser.add_argument(
+      "--regression-error-threshold",
+      type=float,
+      default=0.2,
+      help="Physical XY error threshold in meters for regression boundary splits.",
+  )
+  parser.add_argument(
+      "--regression-xy-threshold",
+      type=float,
+      default=0.2,
+      help="Physical XY L2 error threshold in meters for final-xy-yaw regression splits.",
+  )
+  parser.add_argument(
+      "--regression-yaw-threshold-deg",
+      type=float,
+      default=1.0,
+      help="Physical yaw error threshold in degrees for final-xy-yaw regression splits.",
   )
   parser.add_argument("--lr", type=float, default=3e-4)
   parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -809,6 +930,12 @@ def main() -> None:
     raise ValueError("--history-len + --horizon-len must be <= --num-steps")
   if args.loss_mode == "discrete" and args.target_mode == "full-trajectory":
     raise ValueError("--loss-mode discrete currently supports endpoint target modes only")
+  if args.loss_mode == "regression" and args.target_mode not in {"final-xy", "final-xy-yaw"}:
+    raise ValueError("--loss-mode regression currently supports --target-mode final-xy or final-xy-yaw only")
+  if args.regression_xy_threshold <= 0:
+    raise ValueError("--regression-xy-threshold must be > 0")
+  if args.regression_yaw_threshold_deg <= 0:
+    raise ValueError("--regression-yaw-threshold-deg must be > 0")
 
   torch.manual_seed(args.seed)
   device = torch.device(args.device)
@@ -883,6 +1010,22 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
     score_label = "1s trajectory NLL"
+  elif args.loss_mode == "regression":
+    model = EndpointRegressionGRU(
+        state_dim=x.shape[-1],
+        target_dim=train_target.shape[-1],
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+    ).to(device)
+    if args.target_mode == "final-xy-yaw":
+      score_label = (
+          "max(1s XY error / "
+          f"{args.regression_xy_threshold:.2f}m, "
+          f"yaw error / {args.regression_yaw_threshold_deg:.1f}deg)"
+      )
+    else:
+      score_label = "1s endpoint XY error (m)"
   elif args.loss_mode == "discrete":
     model = EndpointDiscreteGRU(
         state_dim=x.shape[-1],
@@ -894,6 +1037,8 @@ def main() -> None:
     ).to(device)
     if args.target_mode == "final-xy":
       score_label = "1s endpoint XY CE"
+    elif args.target_mode == "final-xy-yaw":
+      score_label = "1s endpoint XY+yaw CE"
     elif args.target_mode == "final-velocity":
       score_label = "1s endpoint velocity CE"
     else:
@@ -908,6 +1053,8 @@ def main() -> None:
     ).to(device)
     if args.target_mode == "final-xy":
       score_label = "1s endpoint XY NLL"
+    elif args.target_mode == "final-xy-yaw":
+      score_label = "1s endpoint XY+yaw NLL"
     elif args.target_mode == "final-velocity":
       score_label = "1s endpoint velocity NLL"
     else:
@@ -926,7 +1073,7 @@ def main() -> None:
       device,
   )
 
-  val_nll, val_entropy = score_trajectories(
+  val_nll, val_entropy, val_xy_error, val_yaw_error = score_trajectories(
       model,
       val_history,
       val_target,
@@ -936,12 +1083,22 @@ def main() -> None:
       val_x.shape[1],
       args.batch_size,
       args,
+      target_mean,
+      target_std,
       device,
   )
   val_physical = val_x
   jerk = acceleration_change_score(val_physical)
   speed = speed_norm(val_physical)
-  rows, boundaries = summarize_boundaries(val_nll, val_entropy, jerk, val_labels, args)
+  rows, boundaries = summarize_boundaries(
+      val_nll,
+      val_entropy,
+      val_xy_error,
+      val_yaw_error,
+      jerk,
+      val_labels,
+      args,
+  )
 
   output_dir = Path(args.plot_dir)
   csv_path = output_dir / "boundary_splits.csv"
