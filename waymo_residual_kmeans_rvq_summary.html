@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Waymo Residual k-means RVQ Summary</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #5f6b7a;
+      --line: #d8dee8;
+      --panel: #f7f9fc;
+      --accent: #0f766e;
+    }
+
+    body {
+      margin: 36px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      line-height: 1.45;
+      background: white;
+    }
+
+    h1, h2 {
+      margin: 0 0 12px;
+      color: #111827;
+    }
+
+    h1 {
+      font-size: 30px;
+      line-height: 1.15;
+    }
+
+    h2 {
+      margin-top: 34px;
+      font-size: 20px;
+    }
+
+    p {
+      max-width: 980px;
+      margin: 0 0 12px;
+    }
+
+    code {
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: #eef2f7;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 14px;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--panel);
+      font-weight: 650;
+    }
+
+    .summary {
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      max-width: 980px;
+    }
+
+    .metric-good {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .plot-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 26px;
+      margin-top: 16px;
+    }
+
+    figure {
+      margin: 0;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    figcaption {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid #e5e9f0;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Waymo Residual k-means RVQ Summary</h1>
+
+  <div class="summary">
+    <p>
+      Residual k-means RVQ was evaluated with 10 sequential full-trajectory
+      tokens in local XY space. The key change versus the learned RVQ run is
+      that every token codebook is fit directly on the remaining full-sequence
+      reconstruction residual, then validation uses nearest-code residual
+      search. This removes the learned encoder/decoder failure mode and tests
+      whether the discrete residual representation itself has enough capacity.
+    </p>
+    <p>
+      On this split, all three residual k-means RVQ settings beat the naive
+      71x71 per-step XY binning baseline on p90 and p99 error. The 32-code run
+      has the best MSE; the 64-code run has the best p99 and first-3s p99.
+    </p>
+  </div>
+
+  <h2>Metrics</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Method</th>
+        <th>Tokens</th>
+        <th>Codes per token</th>
+        <th>Avg used codes</th>
+        <th>XY MSE</th>
+        <th>XY MAE</th>
+        <th>P90 error</th>
+        <th>P99 error</th>
+        <th>Max first-3s P99</th>
+        <th>P99 by second</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Naive XY bins 71x71</td>
+        <td>10 fixed</td>
+        <td>5041</td>
+        <td>-</td>
+        <td>0.190683</td>
+        <td>0.273484</td>
+        <td>0.660589</td>
+        <td>0.831353</td>
+        <td>0.834026</td>
+        <td><code>1s=0.830951 2s=0.834026 3s=0.833140 4s=0.823479 5s=0.839960</code></td>
+      </tr>
+      <tr>
+        <td>Residual k-means RVQ XY</td>
+        <td>10</td>
+        <td>32</td>
+        <td>31.7</td>
+        <td class="metric-good">0.041374</td>
+        <td>0.056301</td>
+        <td>0.114851</td>
+        <td>0.531381</td>
+        <td>0.610262</td>
+        <td><code>1s=0.329356 2s=0.610262 3s=0.445177 4s=0.574628 5s=0.876712</code></td>
+      </tr>
+      <tr>
+        <td>Residual k-means RVQ XY</td>
+        <td>10</td>
+        <td>64</td>
+        <td>62.9</td>
+        <td>0.089504</td>
+        <td>0.054146</td>
+        <td class="metric-good">0.090054</td>
+        <td class="metric-good">0.493888</td>
+        <td class="metric-good">0.518499</td>
+        <td><code>1s=0.310853 2s=0.391478 3s=0.518499 4s=0.630856 5s=0.988360</code></td>
+      </tr>
+      <tr>
+        <td>Residual k-means RVQ XY</td>
+        <td>10</td>
+        <td>128</td>
+        <td>112.9</td>
+        <td>0.048961</td>
+        <td class="metric-good">0.049838</td>
+        <td>0.090489</td>
+        <td>0.616368</td>
+        <td>0.655841</td>
+        <td><code>1s=0.404331 2s=0.626037 3s=0.601388 4s=0.652942 5s=0.938452</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>First 10 Validation Examples</h2>
+  <div class="plot-grid">
+    <figure>
+      <figcaption>32-code residual k-means RVQ, first 10 validation examples.</figcaption>
+      <img src="waymo_residual_kmeans_vq_xy_tok10_codes32/xy_kmeans_first_samples_prefix_recon.png" alt="32-code residual k-means RVQ first 10 validation examples">
+    </figure>
+    <figure>
+      <figcaption>64-code residual k-means RVQ, first 10 validation examples.</figcaption>
+      <img src="waymo_residual_kmeans_vq_xy_tok10_codes64/xy_kmeans_first_samples_prefix_recon.png" alt="64-code residual k-means RVQ first 10 validation examples">
+    </figure>
+    <figure>
+      <figcaption>128-code residual k-means RVQ, first 10 validation examples.</figcaption>
+      <img src="waymo_residual_kmeans_vq_xy_tok10_codes128/xy_kmeans_first_samples_prefix_recon.png" alt="128-code residual k-means RVQ first 10 validation examples">
+    </figure>
+  </div>
+
+  <h2>Worst 10 Validation Examples</h2>
+  <div class="plot-grid">
+    <figure>
+      <figcaption>32-code residual k-means RVQ, worst 10 validation examples by final XY MSE.</figcaption>
+      <img src="waymo_residual_kmeans_vq_xy_tok10_codes32/xy_kmeans_worst_samples_prefix_recon.png" alt="32-code residual k-means RVQ worst 10 validation examples">
+    </figure>
+    <figure>
+      <figcaption>64-code residual k-means RVQ, worst 10 validation examples by final XY MSE.</figcaption>
+      <img src="waymo_residual_kmeans_vq_xy_tok10_codes64/xy_kmeans_worst_samples_prefix_recon.png" alt="64-code residual k-means RVQ worst 10 validation examples">
+    </figure>
+    <figure>
+      <figcaption>128-code residual k-means RVQ, worst 10 validation examples by final XY MSE.</figcaption>
+      <img src="waymo_residual_kmeans_vq_xy_tok10_codes128/xy_kmeans_worst_samples_prefix_recon.png" alt="128-code residual k-means RVQ worst 10 validation examples">
+    </figure>
+  </div>
+</body>
+</html>
