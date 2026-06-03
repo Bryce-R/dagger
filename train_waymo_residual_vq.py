@@ -239,7 +239,7 @@ def plot_prefix_reconstructions(
     axis.plot(target[:, 0], target[:, 1], "o-", color="black", linewidth=2.2, label="GT")
     for prefix_index, recon_xy in enumerate(prefix_xy):
       color = cmap((prefix_index + 1) / len(prefix_xy))
-      label = f"codebook {prefix_index + 1}" if prefix_index in (0, len(prefix_xy) - 1) else None
+      label = f"token 1..{prefix_index + 1}"
       alpha = 0.25 if prefix_index < len(prefix_xy) - 1 else 0.95
       linewidth = 1.0 if prefix_index < len(prefix_xy) - 1 else 2.0
       axis.plot(
@@ -258,7 +258,7 @@ def plot_prefix_reconstructions(
   for axis in axes.ravel()[len(sample_indices):]:
     axis.axis("off")
   handles, labels = axes.ravel()[0].get_legend_handles_labels()
-  fig.legend(handles, labels, loc="lower center", ncol=3)
+  fig.legend(handles, labels, loc="lower center", ncol=6, fontsize=8)
   fig.suptitle(title, y=0.98)
   fig.tight_layout(rect=(0, 0.05, 1, 0.94))
   fig.savefig(output_path, dpi=180)
